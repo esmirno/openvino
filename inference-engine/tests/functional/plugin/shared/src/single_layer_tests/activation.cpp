@@ -53,7 +53,21 @@ void ActivationLayerTest::SetUp() {
     auto constantsValue = activationDecl.second;
     auto ngPrc = FuncTestUtils::PrecisionUtils::convertIE2nGraphPrc(netPrecision);
     auto params = ngraph::builder::makeParams(ngPrc, {shapes.first});
-    auto activation = ngraph::builder::makeActivation(params[0], ngPrc, activationType, shapes.second, constantsValue);
+
+    std::vector<size_t> kernel {1, 1};
+    std::vector<size_t> stride  {1, 1};
+    std::vector<size_t> padBegin  {0, 0}, padEnd  {0, 0};
+
+    auto maxpool = ngraph::builder::makePooling(params[0],
+                                                stride,
+                                                padBegin,
+                                                padEnd,
+                                                kernel,
+                                                ngraph::op::RoundingType::FLOOR,
+                                                ngraph::op::PadType::SAME_UPPER,
+                                                false,
+                                                ngraph::helpers::MAX);
+    auto activation = ngraph::builder::makeActivation(maxpool, ngPrc, activationType, shapes.second, constantsValue);
 
     function = std::make_shared<ngraph::Function>(ngraph::NodeVector{activation}, params);
 }
