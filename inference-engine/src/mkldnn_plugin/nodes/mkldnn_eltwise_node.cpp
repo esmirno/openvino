@@ -1030,7 +1030,7 @@ void MKLDNNEltwiseNode::initSupportedPrimitiveDescriptors() {
     if (!supportedPrimitiveDescriptors.empty())
         return;
 
-    canUseOptimizedImpl = mayiuse(x64::sse41);
+    canUseOptimizedImpl = false;//mayiuse(x64::sse41);
 
     size_t expectedInputsNum = getOpInputsNum();
     for (auto& postOp : fusedWith) {
@@ -1178,15 +1178,15 @@ void MKLDNNEltwiseNode::initSupportedPrimitiveDescriptors() {
         config.outConfs.push_back(dataConfig);
 
         impl_desc_type impl_type;
-        if (mayiuse(x64::avx512_common)) {
-            impl_type = impl_desc_type::jit_avx512;
-        } else if (mayiuse(x64::avx2)) {
-            impl_type = impl_desc_type::jit_avx2;
-        } else if (mayiuse(x64::sse41)) {
-            impl_type = impl_desc_type::jit_sse42;
-        } else {
+//        if (mayiuse(x64::avx512_common)) {
+//            impl_type = impl_desc_type::jit_avx512;
+//        } else if (mayiuse(x64::avx2)) {
+//            impl_type = impl_desc_type::jit_avx2;
+//        } else if (mayiuse(x64::sse41)) {
+//            impl_type = impl_desc_type::jit_sse42;
+//        } else {
             impl_type = impl_desc_type::ref;
-        }
+//        }
 
         return {config, impl_type};
     };
@@ -1203,10 +1203,10 @@ void MKLDNNEltwiseNode::initSupportedPrimitiveDescriptors() {
         isBlockedApplicable = isBlockedApplicable && getChildEdgeAt(0)->getDims().ndims() == getParentEdgeAt(i)->getDims().ndims();
     }
 
-    if (isChannelsFirstApplicable)
-        supportedPrimitiveDescriptors.emplace_back(initDesc(ChannelsFirst));
-    if (isBlockedApplicable)
-        supportedPrimitiveDescriptors.emplace_back(initDesc(Blocked));
+//    if (isChannelsFirstApplicable)
+//        supportedPrimitiveDescriptors.emplace_back(initDesc(ChannelsFirst));
+//    if (isBlockedApplicable)
+//        supportedPrimitiveDescriptors.emplace_back(initDesc(Blocked));
     supportedPrimitiveDescriptors.emplace_back(initDesc(Planar));
 }
 
@@ -1682,15 +1682,15 @@ void MKLDNNEltwiseNode::execute(mkldnn::stream strm) {
     if (isDynBatchEnabled)
         dims_out[batchDimIdx] = static_cast<size_t>(batchToProcess());
 
-    if (eltwise_kernel) {
-        if (tensorRank == optimalTensorRank) {
-            executeOptimized6D(src_ptrs, dst_ptr);
-        } else {
-            executeOptimizedGeneric(src_ptrs, dst_ptr);
-        }
-    } else {
+//    if (eltwise_kernel) {
+//        if (tensorRank == optimalTensorRank) {
+//            executeOptimized6D(src_ptrs, dst_ptr);
+//        } else {
+//            executeOptimizedGeneric(src_ptrs, dst_ptr);
+//        }
+//    } else {
         executeReference(src_ptrs, dst_ptr);
-    }
+//    }
 }
 
 bool MKLDNNEltwiseNode::created() const {
@@ -1775,6 +1775,8 @@ void MKLDNNEltwiseNode::appendPostOps(mkldnn::post_ops& ops) {
 }
 
 bool MKLDNNEltwiseNode::canFuse(const MKLDNNNodePtr& node) const {
+    return false;
+
     auto isOneOf = [](EltwiseOpType alg, std::vector<EltwiseOpType> algs) {
         for (auto a : algs) {
             if (alg == a) {

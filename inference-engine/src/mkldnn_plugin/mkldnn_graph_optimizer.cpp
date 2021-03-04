@@ -73,8 +73,8 @@ void MKLDNNGraphOptimizer::ApplyCommonGraphOptimizations(MKLDNNGraph &graph) {
     FuseConvolutionAndDepthwise(graph);
     graph.RemoveDroppedNodes();
 
-    FuseConvolutionAndActivation(graph);
-    graph.RemoveDroppedNodes();
+//    FuseConvolutionAndActivation(graph);
+//    graph.RemoveDroppedNodes();
 
     FuseConvolutionAndDepthwise(graph);
     graph.RemoveDroppedNodes();
@@ -106,11 +106,11 @@ void MKLDNNGraphOptimizer::ApplyCommonGraphOptimizations(MKLDNNGraph &graph) {
     RemoveIdentityOperator(graph);
     graph.RemoveDroppedNodes();
 
-    FuseConvolutionSumAndConvolutionSumActivation(graph);
-    graph.RemoveDroppedNodes();
+//    FuseConvolutionSumAndConvolutionSumActivation(graph);
+//    graph.RemoveDroppedNodes();
 
-    FuseConvolutionAndSimpleOperation(graph);
-    graph.RemoveDroppedNodes();
+//    FuseConvolutionAndSimpleOperation(graph);
+//    graph.RemoveDroppedNodes();
 
     FuseFullyConnectedAndSimpleOperation(graph);
     graph.RemoveDroppedNodes();
