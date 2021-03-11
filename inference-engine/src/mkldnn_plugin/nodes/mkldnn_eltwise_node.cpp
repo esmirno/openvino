@@ -1597,19 +1597,15 @@ void MKLDNNEltwiseNode::executeOptimizedGeneric(const std::vector<const uint8_t 
 
 static float MishPwl(float x) {
 
-    std::vector<int> range_vector = {-128, -9, -6, -3, -1, 1, 3, 5, 128};
-    std::vector<int> shift_vector = {-8, -8, -8, -1, -8, -8, -2, 0};
-    std::vector<int> bias_vector = {0, -1, -1, 0, 0, 1, 2, 0};
-
+    std::vector<int> range_vector = {-128, -10, -8, -6, -4, -3, -2, -1, 128};
+    std::vector<int> shift_vector = {-8, -8, -8, -8, -8, -8, -8, 0};
+    std::vector<int> bias_vector = {1, 0, 0, 0, 0, 0, 0, 0};
 
     int postShift = 0;
 
     // rescale input currently covering only -14 14 range lets rescale to it
-    float fqLow  = -30;
-    float fqHigh = 30;
-
-    float outputfqLow  = -30;
-    float outputfqHigh = 30;
+    float fqLow  = -39.0938;
+    float fqHigh = 38.8125;
 
     int zero_point = 128;
     int nBits = 8;
@@ -1618,8 +1614,6 @@ static float MishPwl(float x) {
 
     auto clampedX = std::min(std::max(x, fqLow), fqHigh);
     int quantizedX = round((clampedX - fqLow) / (fqHigh - fqLow) * scale) - zero_point;
-
-    return quantizedX;
 
     int quantizedY = 0;
 
@@ -1655,7 +1649,7 @@ static float MishPwl(float x) {
 
     // dequantize
     float y = quantizedY;
-    y = (y - miny) / scale * (outputfqHigh - outputfqLow) + outputfqLow;
+    y = (y - miny) / scale * (fqHigh - fqLow) + fqLow;
 
     return y;
 }
@@ -1764,7 +1758,7 @@ void MKLDNNEltwiseNode::execute(mkldnn::stream strm) {
 //            executeOptimizedGeneric(src_ptrs, dst_ptr);
 //        }
 //    } else {
-        bool usePWl = true;
+        bool usePWl = false;
         if (getName() == "activation/mul") {
             usePWl = true;
         }
