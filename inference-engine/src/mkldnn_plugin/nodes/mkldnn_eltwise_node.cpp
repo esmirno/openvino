@@ -1596,29 +1596,36 @@ void MKLDNNEltwiseNode::executeOptimizedGeneric(const std::vector<const uint8_t 
 }
 
 static float MishPwl(float x) {
-    std::vector<int> range_vector = {-128, -109, -90, -72, -54, -36, -18, 0, 128};
-    std::vector<int> shift_vector = {-12, -12, -12, -12, -12, -12, -12, 0};
-    std::vector<int> bias_vector = {1, 1, 1, 1, 1, 1, 1, 0};
+
+    std::vector<int> range_vector = {-128, -9, -6, -3, -1, 1, 3, 5, 128};
+    std::vector<int> shift_vector = {-8, -8, -8, -1, -8, -8, -2, 0};
+    std::vector<int> bias_vector = {0, -1, -1, 0, 0, 1, 2, 0};
+
 
     int postShift = 0;
 
     // rescale input currently covering only -14 14 range lets rescale to it
-    float fqLow  = -27;
-    float fqHigh = 27;
+    float fqLow  = -30;
+    float fqHigh = 30;
 
-    float outputfqLow  = -27;
-    float outputfqHigh = 27;
+    float outputfqLow  = -30;
+    float outputfqHigh = 30;
 
     int zero_point = 128;
     int nBits = 8;
+    int miny = -(1 << (nBits - 1));
+    float scale = (1 << nBits) - 1;
 
     auto clampedX = std::min(std::max(x, fqLow), fqHigh);
-    int quantizedX = (clampedX - fqLow) / (fqHigh - fqLow) * ((1 << nBits) - 1) - zero_point;
+    int quantizedX = round((clampedX - fqLow) / (fqHigh - fqLow) * scale) - zero_point;
+
+    return quantizedX;
+
     int quantizedY = 0;
 
     for (size_t i = 0; i != range_vector.size(); i++) {
         if (quantizedX < range_vector[i]) {
-            if (i == 0) throw std::logic_error("Invalid qunatized value for u8: " + std::to_string(quantizedX));
+            if (i == 0) throw std::logic_error("Invalid quantized value for u8: " + std::to_string(quantizedX));
 
             if (shift_vector[i-1] < 0) {
                 quantizedY = quantizedX >> (-shift_vector[i-1]);
@@ -1637,19 +1644,23 @@ static float MishPwl(float x) {
                 quantizedY <<= -postShift;
             }
             // 1 byte clamp
-            quantizedY &=  0xFF;
+            if (quantizedY > 0) {
+                quantizedY &= 0xFF;
+            } else {
+                quantizedY = std::max(quantizedY, miny);
+            }
             break;
         }
     }
 
     // dequantize
     float y = quantizedY;
-    y = y / ((1 << nBits) - 1) * (outputfqHigh - outputfqLow);
+    y = (y - miny) / scale * (outputfqHigh - outputfqLow) + outputfqLow;
 
     return y;
 }
 
-void MKLDNNEltwiseNode::executeReference(const std::vector<const uint8_t *>& src_ptrs, uint8_t *dst_ptr) {
+void MKLDNNEltwiseNode::executeReference(const std::vector<const uint8_t *>& src_ptrs, uint8_t *dst_ptr, bool usePwl) {
     size_t inputNum = src_ptrs.size();
 
     std::shared_ptr<ref_eltwise_scalar_fwd_t> ref_eltwise_injector = nullptr;
@@ -1696,9 +1707,12 @@ void MKLDNNEltwiseNode::executeReference(const std::vector<const uint8_t *>& src
                     *dst_ptr_f = ref_eltwise_injector->compute_scalar(src_f[0]);
                     break;
                 case Mish: {
-                   // *dst_ptr_f = ref_eltwise_injector->compute_scalar(src_f[0]);
-                    *dst_ptr_f = MishPwl(src_f[0]);
-                    //printf("mish for.4f : ref= %f, pwl=%f\n", src_f[0], *dst_ptr_f, pwl_mish);
+                    if (usePwl) {
+                        *dst_ptr_f = MishPwl(src_f[0]);
+                      //  printf("mish for%.4f : pwl=%.4f\n", src_f[0], *dst_ptr_f);
+                    } else {
+                        *dst_ptr_f = ref_eltwise_injector->compute_scalar(src_f[0]);
+                    }
                     break;
                 }
                 case Add:               *dst_ptr_f = src_f[0] + src_f[1]; break;
@@ -1750,7 +1764,11 @@ void MKLDNNEltwiseNode::execute(mkldnn::stream strm) {
 //            executeOptimizedGeneric(src_ptrs, dst_ptr);
 //        }
 //    } else {
-        executeReference(src_ptrs, dst_ptr);
+        bool usePWl = true;
+        if (getName() == "activation/mul") {
+            usePWl = true;
+        }
+        executeReference(src_ptrs, dst_ptr, usePWl);
 //    }
 }
 

@@ -168,7 +168,7 @@ private:
 
     inline void executeOptimized6D(const std::vector<const uint8_t *>& src_ptrs, uint8_t *dst_ptr);
     inline void executeOptimizedGeneric(const std::vector<const uint8_t *>& src_ptrs, uint8_t *dst_ptr);
-    inline void executeReference(const std::vector<const uint8_t *>& src_ptrs, uint8_t *dst_ptr);
+    inline void executeReference(const std::vector<const uint8_t *>& src_ptrs, uint8_t *dst_ptr, bool);
 
     void offset_out_calc(std::vector<size_t>& offset, std::vector<size_t>& dims);
     void offset_in_calc(std::vector<size_t>& offset, std::vector<size_t>& dims_in, std::vector<size_t>& dims_out);
