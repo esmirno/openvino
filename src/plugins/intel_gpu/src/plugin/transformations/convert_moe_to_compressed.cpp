@@ -230,7 +230,7 @@ ConvertMOEToMOECompressed::ConvertMOEToMOECompressed(bool is_pa) {
             config.group_size = group_compressed ? weight_shape[3] : std::numeric_limits<size_t>::max();
             auto topk_shape = pattern_map.at(topk_m).get_partial_shape();
             if (!topk_shape[1].is_static()) {
-                OPENVINO_THROW("K dimenion in moe topk input should be static..");
+                OPENVINO_THROW("K dimension in moe topk input should be static.");
             }
             config.top_k = topk_shape[1].get_length();
             config.out_type = ov::element::f16;
