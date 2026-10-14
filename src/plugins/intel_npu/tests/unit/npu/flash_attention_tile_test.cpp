@@ -4,6 +4,9 @@
 
 #include "intel_npu/ops/flash_attention_tile.hpp"
 
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <gtest/gtest.h>
 
 #include <limits>
@@ -54,8 +57,39 @@ ov::Tensor make_filled_tensor(ov::element::Type type, const ov::Shape& shape, fl
     } else if (type == ov::element::f16) {
         auto* data = tensor.data<ov::float16>();
         std::fill_n(data, count, ov::float16(value));
+    } else if (type == ov::element::i8) {
+        auto* data = tensor.data<int8_t>();
+        std::fill_n(data, count, static_cast<int8_t>(value));
+    } else if (type == ov::element::u8) {
+        auto* data = tensor.data<uint8_t>();
+        std::fill_n(data, count, static_cast<uint8_t>(value));
     }
     return tensor;
+}
+
+ov::Tensor tensor_to_f32(const ov::Tensor& src);
+
+ov::Tensor quantize_i8(const ov::Tensor& source, float scale, int8_t zero_point = 0) {
+    auto source_f32 = tensor_to_f32(source);
+    ov::Tensor result(ov::element::i8, source.get_shape());
+    const auto* src = source_f32.data<const float>();
+    auto* dst = result.data<int8_t>();
+    for (size_t i = 0; i < source.get_size(); ++i) {
+        auto quantized = std::lround(src[i] / scale) + zero_point;
+        quantized = std::clamp<long>(quantized, -128, 127);
+        dst[i] = static_cast<int8_t>(quantized);
+    }
+    return result;
+}
+
+ov::Tensor dequantize_i8(const ov::Tensor& source, float scale, int8_t zero_point = 0) {
+    ov::Tensor result(ov::element::f32, source.get_shape());
+    const auto* src = source.data<const int8_t>();
+    auto* dst = result.data<float>();
+    for (size_t i = 0; i < source.get_size(); ++i) {
+        dst[i] = (static_cast<float>(src[i]) - zero_point) * scale;
+    }
+    return result;
 }
 
 ov::Tensor tensor_to_f32(const ov::Tensor& src) {
@@ -95,20 +129,19 @@ FlashAttentionResult run_flash_attention_tile(const ov::Tensor& query,
     auto rm_param = std::make_shared<ov::op::v0::Parameter>(elem_type, running_max.get_shape());
     auto rs_param = std::make_shared<ov::op::v0::Parameter>(elem_type, running_sum.get_shape());
 
-    std::shared_ptr<FlashAttentionTile> op;
+    FlashAttentionTile::OptionalInputs optional_inputs;
     if (mask) {
-        auto mask_param = std::make_shared<ov::op::v0::Parameter>(mask->get_element_type(), mask->get_shape());
-        op = std::make_shared<FlashAttentionTile>(q_param,
-                                                  k_param,
-                                                  v_param,
-                                                  ro_param,
-                                                  rm_param,
-                                                  rs_param,
-                                                  mask_param,
-                                                  config);
-    } else {
-        op = std::make_shared<FlashAttentionTile>(q_param, k_param, v_param, ro_param, rm_param, rs_param, config);
+        optional_inputs.attention_mask =
+            std::make_shared<ov::op::v0::Parameter>(mask->get_element_type(), mask->get_shape());
     }
+    auto op = std::make_shared<FlashAttentionTile>(q_param,
+                                                   k_param,
+                                                   v_param,
+                                                   ro_param,
+                                                   rm_param,
+                                                   rs_param,
+                                                   optional_inputs,
+                                                   config);
 
     const auto& out_shape = op->get_output_shape(0);
     const auto& max_shape = op->get_output_shape(1);
@@ -150,6 +183,73 @@ FlashAttentionResult run_flash_attention_tile(const ov::Tensor& query,
     auto running_sum = make_filled_tensor(elem_type, state_shape, 0.0f);
 
     return run_flash_attention_tile(query, key, value, running_output, running_max, running_sum, mask, config);
+}
+
+FlashAttentionResult run_compressed_flash_attention_tile(const ov::Tensor& query,
+                                                          const ov::Tensor& key,
+                                                          const ov::Tensor& value,
+                                                          const ov::Tensor& key_scale,
+                                                          const ov::Tensor& value_scale,
+                                                          const ov::Tensor* key_zero_point,
+                                                          const ov::Tensor* value_zero_point,
+                                                          const ov::Tensor* attention_mask = nullptr) {
+    auto q_param = std::make_shared<ov::op::v0::Parameter>(query.get_element_type(), query.get_shape());
+    auto k_param = std::make_shared<ov::op::v0::Parameter>(key.get_element_type(), key.get_shape());
+    auto v_param = std::make_shared<ov::op::v0::Parameter>(value.get_element_type(), value.get_shape());
+    auto ks_param = std::make_shared<ov::op::v0::Parameter>(key_scale.get_element_type(), key_scale.get_shape());
+    auto vs_param = std::make_shared<ov::op::v0::Parameter>(value_scale.get_element_type(), value_scale.get_shape());
+    auto running_output = make_filled_tensor(query.get_element_type(), {1, 1, 2, 4}, 0.0f);
+    auto running_max = make_filled_tensor(query.get_element_type(), {1, 1, 2}, -std::numeric_limits<float>::infinity());
+    auto running_sum = make_filled_tensor(query.get_element_type(), {1, 1, 2}, 0.0f);
+    auto ro_param =
+        std::make_shared<ov::op::v0::Parameter>(running_output.get_element_type(), running_output.get_shape());
+    auto rm_param = std::make_shared<ov::op::v0::Parameter>(running_max.get_element_type(), running_max.get_shape());
+    auto rs_param = std::make_shared<ov::op::v0::Parameter>(running_sum.get_element_type(), running_sum.get_shape());
+
+    FlashAttentionTile::Config config{true, false};
+    FlashAttentionTile::OptionalInputs optional_inputs;
+    if (attention_mask) {
+        optional_inputs.attention_mask =
+            std::make_shared<ov::op::v0::Parameter>(attention_mask->get_element_type(), attention_mask->get_shape());
+    }
+    optional_inputs.key_scale = ks_param;
+    optional_inputs.value_scale = vs_param;
+    ov::TensorVector inputs{query, key, value, running_output, running_max, running_sum};
+    if (attention_mask) {
+        inputs.push_back(*attention_mask);
+    }
+    std::shared_ptr<FlashAttentionTile> op;
+    ov::TensorVector outputs;
+    if (key_zero_point) {
+        optional_inputs.key_zero_point =
+            std::make_shared<ov::op::v0::Parameter>(key_zero_point->get_element_type(), key_zero_point->get_shape());
+    }
+    if (value_zero_point) {
+        optional_inputs.value_zero_point =
+            std::make_shared<ov::op::v0::Parameter>(value_zero_point->get_element_type(), value_zero_point->get_shape());
+    }
+    op = std::make_shared<FlashAttentionTile>(q_param,
+                                              k_param,
+                                              v_param,
+                                              ro_param,
+                                              rm_param,
+                                              rs_param,
+                                              optional_inputs,
+                                              config);
+    inputs.push_back(key_scale);
+    if (key_zero_point) {
+        inputs.push_back(*key_zero_point);
+    }
+    inputs.push_back(value_scale);
+    if (value_zero_point) {
+        inputs.push_back(*value_zero_point);
+    }
+
+    outputs = {ov::Tensor(query.get_element_type(), op->get_output_shape(0)),
+               ov::Tensor(query.get_element_type(), op->get_output_shape(1)),
+               ov::Tensor(query.get_element_type(), op->get_output_shape(2))};
+    EXPECT_TRUE(op->evaluate(outputs, inputs));
+    return {outputs[0], outputs[1], outputs[2]};
 }
 
 // --- Normalize running output by running sum ---
@@ -320,6 +420,81 @@ ov::Tensor slice_mask_s_dim(const ov::Tensor& mask, size_t s_begin, size_t s_end
 // ============================================================================
 
 class FlashAttentionTileTest : public ::testing::Test {};
+
+TEST_F(FlashAttentionTileTest, SymmetricCompressedKVMatchesDequantizedReference) {
+    auto Q = make_random_tensor(ov::element::f32, {1, 1, 2, 4}, 30);
+    auto K_f32 = make_random_tensor(ov::element::f32, {1, 1, 3, 4}, 31);
+    auto V_f32 = make_random_tensor(ov::element::f32, {1, 1, 3, 4}, 32);
+    constexpr float key_scale_value = 0.05f;
+    constexpr float value_scale_value = 0.04f;
+    auto K = quantize_i8(K_f32, key_scale_value);
+    auto V = quantize_i8(V_f32, value_scale_value);
+    auto key_scale = make_filled_tensor(ov::element::f32, {1, 1, 3, 1}, key_scale_value);
+    auto value_scale = make_filled_tensor(ov::element::f32, {1, 1, 3, 1}, value_scale_value);
+
+    auto result = run_compressed_flash_attention_tile(Q, K, V, key_scale, value_scale, nullptr, nullptr);
+    auto actual = normalize_output(result.output, result.output_sum);
+    auto expected = run_sdpa_reference(Q,
+                                       dequantize_i8(K, key_scale_value),
+                                       dequantize_i8(V, value_scale_value),
+                                       nullptr,
+                                       {});
+
+    compare_vectors(actual, expected, 1e-5f, "SymmetricCompressedKVMatchesDequantizedReference");
+}
+
+TEST_F(FlashAttentionTileTest, AsymmetricCompressedKVMatchesDequantizedReference) {
+    auto Q = make_random_tensor(ov::element::f32, {1, 1, 2, 4}, 33);
+    auto K_f32 = make_random_tensor(ov::element::f32, {1, 1, 3, 4}, 34);
+    auto V_f32 = make_random_tensor(ov::element::f32, {1, 1, 3, 4}, 35);
+    constexpr int8_t key_zero_point_value = 7;
+    constexpr int8_t value_zero_point_value = -4;
+    constexpr float key_scale_value = 0.03f;
+    constexpr float value_scale_value = 0.06f;
+    auto K = quantize_i8(K_f32, key_scale_value, key_zero_point_value);
+    auto V = quantize_i8(V_f32, value_scale_value, value_zero_point_value);
+    auto key_scale = make_filled_tensor(ov::element::f32, {1, 1, 3, 1}, key_scale_value);
+    auto value_scale = make_filled_tensor(ov::element::f32, {1, 1, 3, 1}, value_scale_value);
+    auto key_zero_point = make_filled_tensor(ov::element::i8, {1, 1, 3, 1}, key_zero_point_value);
+    auto value_zero_point = make_filled_tensor(ov::element::i8, {1, 1, 3, 1}, value_zero_point_value);
+
+    auto result =
+        run_compressed_flash_attention_tile(Q, K, V, key_scale, value_scale, &key_zero_point, &value_zero_point);
+    auto actual = normalize_output(result.output, result.output_sum);
+    auto expected = run_sdpa_reference(Q,
+                                       dequantize_i8(K, key_scale_value, key_zero_point_value),
+                                       dequantize_i8(V, value_scale_value, value_zero_point_value),
+                                       nullptr,
+                                       {});
+
+    compare_vectors(actual, expected, 1e-5f, "AsymmetricCompressedKVMatchesDequantizedReference");
+}
+
+TEST_F(FlashAttentionTileTest, MixedAsymmetricKeyAndSymmetricValueMatchesDequantizedReference) {
+    auto Q = make_random_tensor(ov::element::f32, {1, 1, 2, 4}, 36);
+    auto K_f32 = make_random_tensor(ov::element::f32, {1, 1, 3, 4}, 37);
+    auto V_f32 = make_random_tensor(ov::element::f32, {1, 1, 3, 4}, 38);
+    constexpr int8_t key_zero_point_value = 5;
+    constexpr float key_scale_value = 0.03f;
+    constexpr float value_scale_value = 0.04f;
+    auto K = quantize_i8(K_f32, key_scale_value, key_zero_point_value);
+    auto V = quantize_i8(V_f32, value_scale_value);
+    auto key_scale = make_filled_tensor(ov::element::f32, {1, 1, 3, 1}, key_scale_value);
+    auto value_scale = make_filled_tensor(ov::element::f32, {1, 1, 3, 1}, value_scale_value);
+    auto key_zero_point = make_filled_tensor(ov::element::i8, {1, 1, 3, 1}, key_zero_point_value);
+    auto attention_mask = make_filled_tensor(ov::element::f32, {1, 1, 2, 3}, 0.0f);
+
+    auto result = run_compressed_flash_attention_tile(
+        Q, K, V, key_scale, value_scale, &key_zero_point, nullptr, &attention_mask);
+    auto actual = normalize_output(result.output, result.output_sum);
+    auto expected = run_sdpa_reference(Q,
+                                       dequantize_i8(K, key_scale_value, key_zero_point_value),
+                                       dequantize_i8(V, value_scale_value),
+                                       attention_mask.data<const float>(),
+                                       attention_mask.get_shape());
+
+    compare_vectors(actual, expected, 1e-5f, "MixedAsymmetricKeyAndSymmetricValueMatchesDequantizedReference");
+}
 
 // ============================================================================
 // 1. Basic Correctness (single tile, is_head=true, is_tail=false, then normalize)

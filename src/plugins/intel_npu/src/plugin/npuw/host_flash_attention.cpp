@@ -242,25 +242,19 @@ static FlashAttentionResults execute_fused_flash_attention(const HFATileF32Nodes
     OPENVINO_ASSERT(!is_last_tile || f32_nodes.mask_tile_f32,
                     "Final fused HFA tile requires mask input, but mask_tile_f32 is missing");
 
-    std::shared_ptr<ov::intel_npu::op::FlashAttentionTile> flash_attn_tile;
+    ov::intel_npu::op::FlashAttentionTile::OptionalInputs optional_inputs;
     if (use_mask) {
-        flash_attn_tile = std::make_shared<ov::intel_npu::op::FlashAttentionTile>(q_input,
-                                                                                  k_input,
-                                                                                  v_for_attn,
-                                                                                  f32_nodes.past_acc_f32,
-                                                                                  past_max_squeezed,
-                                                                                  past_sum_squeezed,
-                                                                                  f32_nodes.mask_tile_f32,
-                                                                                  config);
-    } else {
-        flash_attn_tile = std::make_shared<ov::intel_npu::op::FlashAttentionTile>(q_input,
-                                                                                  k_input,
-                                                                                  v_for_attn,
-                                                                                  f32_nodes.past_acc_f32,
-                                                                                  past_max_squeezed,
-                                                                                  past_sum_squeezed,
-                                                                                  config);
+        optional_inputs.attention_mask = f32_nodes.mask_tile_f32;
     }
+    std::shared_ptr<ov::intel_npu::op::FlashAttentionTile> flash_attn_tile;
+    flash_attn_tile = std::make_shared<ov::intel_npu::op::FlashAttentionTile>(q_input,
+                                                                               k_input,
+                                                                               v_for_attn,
+                                                                               f32_nodes.past_acc_f32,
+                                                                               past_max_squeezed,
+                                                                               past_sum_squeezed,
+                                                                               optional_inputs,
+                                                                               config);
 
     flash_attn_tile->set_friendly_name("npu_op_flash_attention_tile");
     FlashAttentionResults results;
