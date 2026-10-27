@@ -6,15 +6,14 @@
 
 #include <gtest/gtest.h>
 
-#include "util.hpp"
-
 #include "openvino/op/concat.hpp"
 #include "openvino/op/convert.hpp"
 #include "openvino/op/multiply.hpp"
-#include "openvino/op/subtract.hpp"
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/result.hpp"
+#include "openvino/op/subtract.hpp"
 #include "openvino/pass/manager.hpp"
+#include "util.hpp"
 
 using namespace ov;
 using namespace ov::npuw::pass;
@@ -480,10 +479,7 @@ TEST_F(SplitKVCacheIntoBlocksTest, HeterogeneousKVShapesAcrossLayers) {
 class SplitCompressedKVCacheIntoBlocksTest : public ::testing::Test {
 protected:
     // seq_axis: 2 for key / non-transposed value, 3 for a transposed value.
-    static std::shared_ptr<ov::Model> build(const std::string& kv,
-                                            int64_t seq_axis,
-                                            size_t seq_len,
-                                            bool asymmetric) {
+    static std::shared_ptr<ov::Model> build(const std::string& kv, int64_t seq_axis, size_t seq_len, bool asymmetric) {
         const std::string dq = "DynamicQuantize/0/past_key_values/" + kv;
         ov::Shape data_shape{1, 2, 8, 8};
         data_shape[seq_axis] = seq_len;

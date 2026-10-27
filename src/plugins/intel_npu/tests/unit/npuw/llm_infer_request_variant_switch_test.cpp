@@ -46,7 +46,8 @@ struct LLMVariantSwitchTestAccess {
         return compiled->m_kvcache_desc.max_generation_token_len;
     }
 
-    static void set_num_stored_tokens(const std::shared_ptr<ov::npuw::LLMCompiledModel>& compiled, uint32_t num_tokens) {
+    static void set_num_stored_tokens(const std::shared_ptr<ov::npuw::LLMCompiledModel>& compiled,
+                                      uint32_t num_tokens) {
         compiled->m_kvcache_desc.num_stored_tokens = num_tokens;
     }
 
@@ -511,8 +512,7 @@ TEST_F(LLMInferRequestVariantSwitchTest, BlockKvCacheRejectsQuantizedKvCacheWith
                               factory);
         FAIL() << "Expected block-based compressed KV cache with Pyramid attention to be rejected";
     } catch (const ov::Exception& ex) {
-        EXPECT_NE(std::string(ex.what()).find("not yet supported with HFA or Pyramid"), std::string::npos)
-            << ex.what();
+        EXPECT_NE(std::string(ex.what()).find("not yet supported with HFA or Pyramid"), std::string::npos) << ex.what();
     }
 }
 
@@ -531,7 +531,8 @@ TEST_F(LLMInferRequestVariantSwitchTest, BlockKvCacheSplitsQuantizedAuxParameter
     ASSERT_NE(compiled, nullptr);
     ASSERT_TRUE(LLMVariantSwitchTestAccess::is_block_kv_cache(compiled));
 
-    auto variant = std::dynamic_pointer_cast<FakeSubCompiledModel>(LLMVariantSwitchTestAccess::generate_variant(compiled, 0u));
+    auto variant =
+        std::dynamic_pointer_cast<FakeSubCompiledModel>(LLMVariantSwitchTestAccess::generate_variant(compiled, 0u));
     ASSERT_NE(variant, nullptr);
     const auto model = variant->get_runtime_model();
     ASSERT_NE(model, nullptr);

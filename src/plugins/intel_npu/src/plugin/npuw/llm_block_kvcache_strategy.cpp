@@ -771,9 +771,8 @@ bool LLMBlockKVCacheStrategy::redirect_prefill_outputs_to_new_blocks(
     size_t total_blocks_allocated = 0;
     size_t total_outputs_bound = 0;
 
-    auto process_kv_blocks = [&](const std::string& output_name,
-                                 const std::string& stream_desc,
-                                 KVCacheBlockManager* manager) -> bool {
+    auto process_kv_blocks =
+        [&](const std::string& output_name, const std::string& stream_desc, KVCacheBlockManager* manager) -> bool {
         uint32_t start_pos = current_position;
         uint32_t end_pos = current_position + num_new_tokens;
         uint32_t start_block_idx = start_pos / m_block_size;
@@ -811,9 +810,7 @@ bool LLMBlockKVCacheStrategy::redirect_prefill_outputs_to_new_blocks(
         auto allocated_blocks = manager->get_allocated_blocks();
         while (allocated_blocks.size() < blocks_needed) {
             auto new_block_id = manager->allocate_block();
-            OPENVINO_ASSERT(new_block_id.has_value(),
-                            "Failed to allocate block for ",
-                            stream_desc);
+            OPENVINO_ASSERT(new_block_id.has_value(), "Failed to allocate block for ", stream_desc);
             total_blocks_allocated++;
             allocated_blocks = manager->get_allocated_blocks();
         }
@@ -827,8 +824,8 @@ bool LLMBlockKVCacheStrategy::redirect_prefill_outputs_to_new_blocks(
             uint32_t block_start_pos = start_block_idx * m_block_size;
             manager->update_block_tokens(target_block_id, end_pos - block_start_pos);
             total_outputs_bound++;
-            LOG_VERB("Bound " << stream_desc << " output to block_" << start_block_idx
-                              << " (zero-copy, " << num_new_tokens << " tokens, metadata updated)");
+            LOG_VERB("Bound " << stream_desc << " output to block_" << start_block_idx << " (zero-copy, "
+                              << num_new_tokens << " tokens, metadata updated)");
         }
         return true;
     };
@@ -836,7 +833,9 @@ bool LLMBlockKVCacheStrategy::redirect_prefill_outputs_to_new_blocks(
     for (const auto& [layer_idx, layer_managers] : m_kv_cache_block_managers) {
         const std::string layer_str = std::to_string(layer_idx);
         if (layer_managers.key_manager) {
-            process_kv_blocks("present." + layer_str + ".key", "key layer " + layer_str, layer_managers.key_manager.get());
+            process_kv_blocks("present." + layer_str + ".key",
+                              "key layer " + layer_str,
+                              layer_managers.key_manager.get());
         }
         if (layer_managers.value_manager) {
             process_kv_blocks("present." + layer_str + ".value",

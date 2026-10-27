@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <string>
@@ -78,6 +79,11 @@ struct LLMContinuedPrefillTestAccess {
     static const std::unordered_map<uint32_t, ov::npuw::LayerBlockManagers>& block_managers(
         const ov::npuw::LLMBlockKVCacheStrategy& strategy) {
         return strategy.m_kv_cache_block_managers;
+    }
+
+    static const std::map<std::string, ov::npuw::AuxBlockStream>& aux_streams(
+        const ov::npuw::LLMBlockKVCacheStrategy& strategy) {
+        return strategy.m_aux_streams;
     }
 
     static uint32_t block_size(const ov::npuw::LLMBlockKVCacheStrategy& strategy) {
@@ -358,15 +364,15 @@ protected:
 
     uint32_t generate_seq_dim(const std::string& past_name) {
         const auto& desc = LLMContinuedPrefillTestAccess::desc(*m_request);
-        const bool is_value = ov::npuw::util::isPastValueParam(past_name) ||
-                              ov::npuw::util::isDQScaleOrZPValue(past_name);
+        const bool is_value =
+            ov::npuw::util::isPastValueParam(past_name) || ov::npuw::util::isDQScaleOrZPValue(past_name);
         return (is_value && desc.v_tensors_transposed_gen) ? 3u : desc.dim;
     }
 
     uint32_t prefill_seq_dim(const std::string& past_name) {
         const auto& desc = LLMContinuedPrefillTestAccess::desc(*m_request);
-        const bool is_value = ov::npuw::util::isPastValueParam(past_name) ||
-                              ov::npuw::util::isDQScaleOrZPValue(past_name);
+        const bool is_value =
+            ov::npuw::util::isPastValueParam(past_name) || ov::npuw::util::isDQScaleOrZPValue(past_name);
         return (is_value && desc.v_tensors_transposed_pre) ? 3u : desc.dim;
     }
 
@@ -666,6 +672,101 @@ TEST_F(LLMBlockContinuedPrefillTest, GrantedContinuationTruncatesBlockPoolAndRun
     });
 
     // The continuation hands over to an ordinary generate step on the block pool.
+    run_generate_step(104);
+    EXPECT_EQ(stored_tokens(), 105);
+}
+
+// Compressed block KV cache (STATIC attention): the scale / zero-point streams keep one block pool
+// each, mirroring the data pools through prefill, truncation, delta prefill and generate.
+class LLMQuantizedBlockContinuedPrefillTest : public LLMBlockContinuedPrefillTest {
+protected:
+    void SetUp() override {
+        init({{"NPUW_LLM_PREFILL_ATTENTION_HINT", "STATIC"},
+              {"NPUW_LLM_GENERATE_ATTENTION_HINT", "STATIC"},
+              {"NPUW_LLM_ENABLE_BLOCK_BASED_KV_CACHE", "YES"},
+              {ov::hint::kv_cache_precision.name(), ov::element::i8}});
+        ASSERT_TRUE(LLMContinuedPrefillTestAccess::is_block_kv_cache(request()));
+    }
+};
+
+TEST_F(LLMQuantizedBlockContinuedPrefillTest, AuxPoolsFollowDataPoolsThroughContinuedPrefill) {
+    auto& req = request();
+    auto* strategy = LLMContinuedPrefillTestAccess::block_strategy(req);
+    ASSERT_NE(strategy, nullptr);
+    const auto& aux = LLMContinuedPrefillTestAccess::aux_streams(*strategy);
+    ASSERT_FALSE(aux.empty()) << "A compressed block KV cache must own scale / zero-point block pools";
+    const auto num_layers = LLMContinuedPrefillTestAccess::block_managers(*strategy).size();
+    // The test model quantizes keys and values; every layer owns at least a key scale and a value scale.
+    EXPECT_GE(aux.size(), 2u * num_layers);
+
+    run_full_prefill(72);
+    EXPECT_EQ(stored_tokens(), 72);
+    run_generate_step(72);
+    run_generate_step(73);
+    EXPECT_EQ(stored_tokens(), 74);
+    ASSERT_TRUE(LLMContinuedPrefillTestAccess::generate_initialized(req));
+
+    const uint32_t block_size = LLMContinuedPrefillTestAccess::block_size(*strategy);
+    ASSERT_EQ(block_size, 32u);
+    constexpr uint32_t kKeep = 64u;
+    const uint32_t keep_blocks = kKeep / block_size;
+
+    // 72 tokens = two full blocks + an 8-token block, in the data pools and the aux pools alike.
+    auto check_pool = [&](const ov::npuw::KVCacheBlockManager* manager, size_t blocks, uint32_t tokens) {
+        const auto allocated = manager->get_allocated_blocks();
+        ASSERT_EQ(allocated.size(), blocks);
+        uint32_t total = 0;
+        for (const auto id : allocated) {
+            total += manager->get_block_tokens(id);
+        }
+        EXPECT_EQ(total, tokens);
+    };
+    for_each_manager(*strategy, [&](ov::npuw::KVCacheBlockManager* m) {
+        check_pool(m, 3u, 74u);
+    });
+    for (const auto& [root, stream] : aux) {
+        SCOPED_TRACE(root);
+        check_pool(stream.manager.get(), 3u, 74u);
+    }
+
+    std::unordered_map<const ov::npuw::KVCacheBlockManager*, std::vector<std::vector<uint8_t>>> expected_blocks;
+    uint8_t seed = 31u;
+    auto stamp = [&](ov::npuw::KVCacheBlockManager* manager) {
+        const auto allocated = manager->get_allocated_blocks();
+        std::vector<std::vector<uint8_t>> bytes;
+        for (uint32_t i = 0; i < keep_blocks; ++i) {
+            auto tensor = manager->get_block_tensor(allocated[i]);
+            fill_tensor_pattern(tensor, seed);
+            bytes.push_back(materialize_bytes(tensor));
+            seed = static_cast<uint8_t>(seed + 41u);
+        }
+        expected_blocks.emplace(manager, std::move(bytes));
+    };
+    for_each_manager(*strategy, stamp);
+    for (const auto& [root, stream] : aux) {
+        stamp(stream.manager.get());
+    }
+
+    propose(74);
+    EXPECT_EQ(stored_tokens(), 64);
+    run_delta_prefill(kKeep, 40);
+    EXPECT_EQ(stored_tokens(), 104);
+
+    // 64 retained + 40 delta = 104 tokens = three full blocks + one 8-token block.
+    auto check_after = [&](ov::npuw::KVCacheBlockManager* manager) {
+        check_pool(manager, 4u, 104u);
+        const auto allocated = manager->get_allocated_blocks();
+        const auto& bytes = expected_blocks.at(manager);
+        for (uint32_t i = 0; i < keep_blocks; ++i) {
+            EXPECT_EQ(materialize_bytes(manager->get_block_tensor(allocated[i])), bytes[i]) << "block " << i;
+        }
+    };
+    for_each_manager(*strategy, check_after);
+    for (const auto& [root, stream] : aux) {
+        SCOPED_TRACE(root);
+        check_after(stream.manager.get());
+    }
+
     run_generate_step(104);
     EXPECT_EQ(stored_tokens(), 105);
 }

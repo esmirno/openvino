@@ -231,16 +231,15 @@ bool SplitKVCacheIntoBlocks::run_on_model(const std::shared_ptr<ov::Model>& mode
 
         // The scale / zero-point shapes differ from the data shape only in the embedding
         // axis, so they split along the same sequence axis at the same block boundaries.
-        auto make_block_param = [&](const std::shared_ptr<ov::op::v0::Parameter>& src,
-                                    const std::string& suffix,
-                                    size_t seq_size) {
-            auto block_shape = make_block_shape(src->get_partial_shape(), info.concat_axis, seq_size);
-            auto p = std::make_shared<ov::op::v0::Parameter>(src->get_element_type(), block_shape);
-            const std::string block_name = src->get_friendly_name() + suffix;
-            p->set_friendly_name(block_name);
-            p->output(0).set_names({block_name});
-            return p;
-        };
+        auto make_block_param =
+            [&](const std::shared_ptr<ov::op::v0::Parameter>& src, const std::string& suffix, size_t seq_size) {
+                auto block_shape = make_block_shape(src->get_partial_shape(), info.concat_axis, seq_size);
+                auto p = std::make_shared<ov::op::v0::Parameter>(src->get_element_type(), block_shape);
+                const std::string block_name = src->get_friendly_name() + suffix;
+                p->set_friendly_name(block_name);
+                p->output(0).set_names({block_name});
+                return p;
+            };
 
         // Block suffixes and sizes: full blocks followed by an optional tail.
         std::vector<std::pair<std::string, size_t>> blocks;
