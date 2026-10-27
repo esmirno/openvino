@@ -6,8 +6,12 @@
 
 #include <gtest/gtest.h>
 
+#include "util.hpp"
+
 #include "openvino/op/concat.hpp"
 #include "openvino/op/convert.hpp"
+#include "openvino/op/multiply.hpp"
+#include "openvino/op/subtract.hpp"
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/result.hpp"
 #include "openvino/pass/manager.hpp"
@@ -466,4 +470,147 @@ TEST_F(SplitKVCacheIntoBlocksTest, HeterogeneousKVShapesAcrossLayers) {
     }
     EXPECT_EQ(layer0_blocks, expected_blocks);
     EXPECT_EQ(layer1_blocks, expected_blocks);
+}
+
+// ---------------------------------------------------------------------------
+// Compressed (i8/u8) KV cache: the dequantization chain
+//   Param(i8) -> Convert -> [Subtract(., Convert(zp))] -> Multiply(., scale) -> Concat
+// must be split per block together with its scale / zero-point parameters.
+// ---------------------------------------------------------------------------
+class SplitCompressedKVCacheIntoBlocksTest : public ::testing::Test {
+protected:
+    // seq_axis: 2 for key / non-transposed value, 3 for a transposed value.
+    static std::shared_ptr<ov::Model> build(const std::string& kv,
+                                            int64_t seq_axis,
+                                            size_t seq_len,
+                                            bool asymmetric) {
+        const std::string dq = "DynamicQuantize/0/past_key_values/" + kv;
+        ov::Shape data_shape{1, 2, 8, 8};
+        data_shape[seq_axis] = seq_len;
+        ov::Shape aux_shape = data_shape;
+        aux_shape[seq_axis == 2 ? 3 : 2] = 1;  // the embedding axis collapses to 1
+        ov::Shape present_shape = data_shape;
+        present_shape[seq_axis] = 1;
+
+        auto data = std::make_shared<ov::op::v0::Parameter>(ov::element::i8, data_shape);
+        data->set_friendly_name("past_key_values.0." + kv);
+        data->output(0).set_names({data->get_friendly_name()});
+        auto scale = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, aux_shape);
+        scale->set_friendly_name(dq + "/scale");
+        scale->output(0).set_names({scale->get_friendly_name()});
+        ov::ParameterVector params{data, scale};
+
+        ov::Output<ov::Node> chain = std::make_shared<ov::op::v0::Convert>(data, ov::element::f32);
+        if (asymmetric) {
+            auto zp = std::make_shared<ov::op::v0::Parameter>(ov::element::u8, aux_shape);
+            zp->set_friendly_name(dq + "/zp");
+            zp->output(0).set_names({zp->get_friendly_name()});
+            params.push_back(zp);
+            auto zp_cvt = std::make_shared<ov::op::v0::Convert>(zp, ov::element::f32);
+            chain = std::make_shared<ov::op::v1::Subtract>(chain, zp_cvt);
+        }
+        chain = std::make_shared<ov::op::v1::Multiply>(chain, scale);
+
+        auto present = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, present_shape);
+        present->set_friendly_name("present_input");
+        params.push_back(present);
+        auto concat = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{chain, present}, seq_axis);
+        return std::make_shared<ov::Model>(ov::ResultVector{std::make_shared<ov::op::v0::Result>(concat)}, params);
+    }
+
+    static std::shared_ptr<ov::op::v0::Parameter> find_param(const std::shared_ptr<ov::Model>& m,
+                                                             const std::string& name) {
+        for (const auto& p : m->get_parameters()) {
+            if (p->get_friendly_name() == name) {
+                return p;
+            }
+        }
+        return nullptr;
+    }
+
+    static bool run(const std::shared_ptr<ov::Model>& m, uint32_t block_size, bool v_transposed) {
+        ov::pass::Manager manager;
+        manager.register_pass<SplitKVCacheIntoBlocks>(block_size, v_transposed);
+        return manager.run_passes(m);
+    }
+};
+
+TEST_F(SplitCompressedKVCacheIntoBlocksTest, AsymmetricKeySplitsDataScaleAndZeroPoint) {
+    auto m = build("key", 2, 48, /*asymmetric=*/true);
+    ASSERT_TRUE(run(m, 16, true));
+
+    // 3 blocks x (data, scale, zp) + present input.
+    EXPECT_EQ(m->get_parameters().size(), 3u * 3u + 1u);
+    for (int i = 0; i < 3; ++i) {
+        const auto suffix = "_block_" + std::to_string(i);
+        auto data = find_param(m, "past_key_values.0.key" + suffix);
+        auto scale = find_param(m, "DynamicQuantize/0/past_key_values/key/scale" + suffix);
+        auto zp = find_param(m, "DynamicQuantize/0/past_key_values/key/zp" + suffix);
+        ASSERT_TRUE(data && scale && zp) << suffix;
+        EXPECT_EQ(data->get_shape(), (ov::Shape{1, 2, 16, 8}));
+        EXPECT_EQ(scale->get_shape(), (ov::Shape{1, 2, 16, 1}));
+        EXPECT_EQ(zp->get_shape(), (ov::Shape{1, 2, 16, 1}));
+        EXPECT_EQ(data->get_element_type(), ov::element::i8);
+        EXPECT_EQ(scale->get_element_type(), ov::element::f32);
+        EXPECT_EQ(zp->get_element_type(), ov::element::u8);
+    }
+    EXPECT_FALSE(find_param(m, "past_key_values.0.key"));
+    EXPECT_FALSE(find_param(m, "DynamicQuantize/0/past_key_values/key/scale"));
+    EXPECT_FALSE(find_param(m, "DynamicQuantize/0/past_key_values/key/zp"));
+
+    size_t concats = 0;
+    for (const auto& op : m->get_ops()) {
+        if (auto concat = ov::as_type_ptr<ov::op::v0::Concat>(op)) {
+            ++concats;
+            EXPECT_EQ(concat->get_input_size(), 4u);
+            // Every past input is the per-block dequantization Multiply(Subtract(..), scale).
+            for (size_t i = 0; i < 3; ++i) {
+                EXPECT_TRUE(ov::is_type<ov::op::v1::Multiply>(concat->get_input_node_shared_ptr(i)));
+            }
+        }
+    }
+    EXPECT_EQ(concats, 1u);
+}
+
+TEST_F(SplitCompressedKVCacheIntoBlocksTest, SymmetricTransposedValueSplitsAlongLastAxis) {
+    auto m = build("value", 3, 32, /*asymmetric=*/false);
+    ASSERT_TRUE(run(m, 16, true));
+
+    EXPECT_EQ(m->get_parameters().size(), 2u * 2u + 1u);
+    for (int i = 0; i < 2; ++i) {
+        const auto suffix = "_block_" + std::to_string(i);
+        auto data = find_param(m, "past_key_values.0.value" + suffix);
+        auto scale = find_param(m, "DynamicQuantize/0/past_key_values/value/scale" + suffix);
+        ASSERT_TRUE(data && scale) << suffix;
+        EXPECT_EQ(data->get_shape(), (ov::Shape{1, 2, 8, 16}));
+        EXPECT_EQ(scale->get_shape(), (ov::Shape{1, 2, 1, 16}));
+    }
+    EXPECT_FALSE(find_param(m, "DynamicQuantize/0/past_key_values/value/zp_block_0"));
+}
+
+TEST_F(SplitCompressedKVCacheIntoBlocksTest, TailBlockIsSplitForAuxParametersToo) {
+    auto m = build("key", 2, 40, /*asymmetric=*/true);
+    ASSERT_TRUE(run(m, 16, true));  // 2 full blocks + a tail of 8
+
+    for (const char* name : {"past_key_values.0.key_block_tail",
+                             "DynamicQuantize/0/past_key_values/key/scale_block_tail",
+                             "DynamicQuantize/0/past_key_values/key/zp_block_tail"}) {
+        auto p = find_param(m, name);
+        ASSERT_TRUE(p) << name;
+        EXPECT_EQ(p->get_shape()[2], 8u) << name;
+    }
+}
+
+TEST_F(SplitCompressedKVCacheIntoBlocksTest, BlockParameterNamesAreParsedForTheRuntime) {
+    const auto dq = ov::npuw::util::parseDQBlockParam("DynamicQuantize/3/past_key_values/value/scale_block_7");
+    ASSERT_TRUE(dq.has_value());
+    EXPECT_EQ(dq->root, "DynamicQuantize/3/past_key_values/value/scale");
+    EXPECT_EQ(dq->present, "DynamicQuantize/3/present/value/scale");
+    EXPECT_TRUE(dq->is_value);
+    EXPECT_FALSE(dq->is_tail);
+    EXPECT_EQ(dq->block_idx, 7u);
+    EXPECT_TRUE(ov::npuw::util::parseDQBlockParam("DynamicQuantize/3/past_key_values/key/zp_block_tail")->is_tail);
+    // Contiguous aux and data names are not block parameters.
+    EXPECT_FALSE(ov::npuw::util::isDQScaleOrZPBlockParam("DynamicQuantize/3/past_key_values/key/zp"));
+    EXPECT_FALSE(ov::npuw::util::isDQScaleOrZPBlockParam("past_key_values.3.key_block_1"));
 }

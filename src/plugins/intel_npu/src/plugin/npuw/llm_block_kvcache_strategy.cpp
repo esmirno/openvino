@@ -28,6 +28,9 @@ std::string make_numbered_block_input_name(const std::string& kv_type, const std
 ov::npuw::BlockParamKind classify_block_param(const std::string& name) {
     using ov::npuw::BlockParamKind;
     namespace uu = ov::npuw::util;
+    if (const auto dq = uu::parseDQBlockParam(name)) {
+        return dq->is_tail ? BlockParamKind::AuxTail : BlockParamKind::AuxBlock;
+    }
     const bool is_key = uu::isPastKeyParam(name);
     const bool is_value = uu::isPastValueParam(name);
     if (!is_key && !is_value) {
@@ -81,7 +84,8 @@ size_t set_dummy_block_tensors(const ov::npuw::LLMBlockKVCacheStrategy::Classifi
     using ov::npuw::BlockParamKind;
     size_t block_count = 0;
     for (const auto& [name, cp] : ports_map) {
-        if (cp.kind == BlockParamKind::Skip || cp.kind == BlockParamKind::TailBlock) {
+        if (cp.kind == BlockParamKind::Skip || cp.kind == BlockParamKind::TailBlock ||
+            cp.kind == BlockParamKind::AuxTail) {
             continue;  // skip non-block ports and tail ports (tail is copy-filled separately)
         }
         const auto* dummy = find_dummy_tensor(dummies, cp.port.get_shape(), cp.port.get_element_type());
@@ -121,7 +125,8 @@ std::unordered_map<uint32_t, ov::npuw::LayerBlockBindingHelpers> build_variant_l
     static const std::regex tail_regex(R"(past_key_values\.(\d+)\.)");
     static const std::regex numbered_regex(R"(past_key_values\.(\d+)\.[a-z]+_block_(\d+)$)");
     for (const auto& [name, cp] : classified) {
-        if (cp.kind == BlockParamKind::Skip)
+        if (cp.kind == BlockParamKind::Skip || cp.kind == BlockParamKind::AuxBlock ||
+            cp.kind == BlockParamKind::AuxTail)
             continue;
 
         std::smatch match;
@@ -167,6 +172,48 @@ std::unordered_map<uint32_t, ov::npuw::LayerBlockBindingHelpers> build_variant_l
     return result;
 }
 
+// Build the binding helpers of every quantization-parameter stream of one generate variant.
+std::map<std::string, ov::npuw::BlockBindingHelper> build_variant_aux_helpers(
+    const ov::npuw::LLMBlockKVCacheStrategy::ClassifiedPortsMap& classified,
+    uint32_t block_size) {
+    using ov::npuw::BlockParamKind;
+    struct PerStream {
+        std::map<uint32_t, ov::Output<const ov::Node>> numbered;
+        std::optional<ov::Output<const ov::Node>> tail;
+    };
+    std::map<std::string, PerStream> per_stream;
+    for (const auto& [name, cp] : classified) {
+        if (cp.kind != BlockParamKind::AuxBlock && cp.kind != BlockParamKind::AuxTail) {
+            continue;
+        }
+        const auto dq = ov::npuw::util::parseDQBlockParam(name);
+        if (!dq) {
+            continue;
+        }
+        if (dq->is_tail) {
+            per_stream[dq->root].tail = cp.port;
+        } else {
+            per_stream[dq->root].numbered[dq->block_idx] = cp.port;
+        }
+    }
+    std::map<std::string, ov::npuw::BlockBindingHelper> result;
+    for (auto& [root, stream] : per_stream) {
+        std::vector<ov::Output<const ov::Node>> numbered;
+        numbered.reserve(stream.numbered.size());
+        for (auto& [idx, port] : stream.numbered) {
+            numbered.push_back(port);
+        }
+        result[root] = ov::npuw::BlockBindingHelper::from_ports(std::move(numbered), stream.tail, block_size);
+    }
+    return result;
+}
+
+// Sequence dimension of a KV stream: the key cache and a non-transposed value cache use the
+// KV dimension of the cache descriptor, a transposed value cache keeps it on the last axis.
+uint32_t kv_seq_dim(bool is_value, bool v_transposed, uint32_t kv_dim) {
+    return (is_value && v_transposed) ? 3u : kv_dim;
+}
+
 // Copy a block tensor (or a slice of it) into the tail input port, handling padding correctly.
 void copy_block_to_tail_input(const ov::SoPtr<ov::ITensor>& block_tensor,
                               uint32_t start_token,
@@ -191,7 +238,8 @@ DummyTensorVec collect_unique_block_tensor_entries(
     using ov::npuw::BlockParamKind;
     DummyTensorVec result;
     for (const auto& [name, cp] : classified_ports) {
-        if (cp.kind == BlockParamKind::Skip || cp.kind == BlockParamKind::TailBlock) {
+        if (cp.kind == BlockParamKind::Skip || cp.kind == BlockParamKind::TailBlock ||
+            cp.kind == BlockParamKind::AuxTail) {
             continue;
         }
         const ov::Shape shape = cp.port.get_shape();
@@ -246,6 +294,8 @@ void LLMBlockKVCacheStrategy::on_initialize() {
         const auto& plugin = m_req.m_npuw_llm_compiled_model->get_plugin();
         for (auto& entry : dummy_entries) {
             entry.tensor = ov::npuw::util::allocMem(entry.elem_type, entry.shape, m_req.m_pre_alloc_device, plugin);
+            // Unbound blocks of a compressed cache are dequantized with dummy scales too.
+            ov::npuw::util::fill_tensor_bytes(entry.tensor, 0u);
             LOG_INFO("Allocated dummy block tensor shape=" << entry.shape << " type=" << entry.elem_type << " ("
                                                            << entry.tensor->get_byte_size() << " bytes)");
         }
@@ -268,6 +318,13 @@ void LLMBlockKVCacheStrategy::on_initialize() {
             if (port_it != prefill_out_ports.end()) {
                 m_prefill_original_output_tensors[output_name] = m_req.m_prefill_request->get_tensor(port_it->second);
             }
+        }
+    }
+    for (const auto& [root, stream] : m_aux_streams) {
+        auto port_it = prefill_out_ports.find(stream.present_name);
+        if (port_it != prefill_out_ports.end()) {
+            m_prefill_original_output_tensors[stream.present_name] =
+                m_req.m_prefill_request->get_tensor(port_it->second);
         }
     }
     LOG_INFO("Snapshotted " << m_prefill_original_output_tensors.size() << " original prefill output tensors");
@@ -357,6 +414,9 @@ void LLMBlockKVCacheStrategy::on_reset(uint32_t next_prompt_length) {
             if (layer_managers.value_manager) {
                 layer_managers.value_manager->release(keep_warm_blocks);
             }
+        }
+        for (auto& [root, stream] : m_aux_streams) {
+            stream.manager->release(keep_warm_blocks);
         }
     }
 }
@@ -462,6 +522,14 @@ void LLMBlockKVCacheStrategy::on_generate_kv_init() {
             const uint32_t kv_dim = kvcache_desc.v_tensors_transposed_gen ? 3u : kvcache_desc.dim;
             process_blocks(layer_idx, layer_managers.value_manager.get(), layer_helpers.value_helper, kv_dim, "value");
         }
+    }
+    const auto& aux_helpers = m_variant_aux_binding_helpers.at(m_req.m_kvcache_request);
+    for (const auto& [root, stream] : m_aux_streams) {
+        process_blocks(0u,
+                       stream.manager.get(),
+                       aux_helpers.at(root),
+                       kv_seq_dim(stream.is_value, kvcache_desc.v_tensors_transposed_gen, kvcache_desc.dim),
+                       root.c_str());
     }
 
     LOG_DEBUG("Initial binding complete.");
@@ -592,6 +660,9 @@ void LLMBlockKVCacheStrategy::continue_prefill(uint32_t keep, uint32_t delta_len
         validate(layer_idx, layer_managers.key_manager.get(), "key");
         validate(layer_idx, layer_managers.value_manager.get(), "value");
     }
+    for (const auto& [root, stream] : m_aux_streams) {
+        validate(0u, stream.manager.get(), root.c_str());
+    }
 
     LOG_DEBUG("Continued prefill: truncating block pool to " << keep_blocks << " blocks per layer.");
 
@@ -628,6 +699,9 @@ void LLMBlockKVCacheStrategy::continue_prefill(uint32_t keep, uint32_t delta_len
             layer_managers.value_manager->truncate_allocated(keep_blocks);
         }
     }
+    for (auto& [root, stream] : m_aux_streams) {
+        stream.manager->truncate_allocated(keep_blocks);
+    }
 }
 
 // ============================================================================
@@ -661,6 +735,16 @@ void LLMBlockKVCacheStrategy::load_past_kv_blocks_to_prefill(
         bind_kv_blocks(layer_managers.key_manager.get(), "key");
         bind_kv_blocks(layer_managers.value_manager.get(), "value");
     }
+    for (const auto& [root, stream] : m_aux_streams) {
+        const auto allocated_blocks = stream.manager->get_allocated_blocks();
+        for (size_t block_idx = 0; block_idx < allocated_blocks.size(); ++block_idx) {
+            auto port_it = prefill_in_ports.find(root + "_block_" + std::to_string(block_idx));
+            if (port_it != prefill_in_ports.end()) {
+                prefill_request->set_tensor(port_it->second,
+                                            stream.manager->get_block_tensor(allocated_blocks[block_idx]));
+            }
+        }
+    }
 }
 
 bool LLMBlockKVCacheStrategy::redirect_prefill_outputs_to_new_blocks(
@@ -687,7 +771,9 @@ bool LLMBlockKVCacheStrategy::redirect_prefill_outputs_to_new_blocks(
     size_t total_blocks_allocated = 0;
     size_t total_outputs_bound = 0;
 
-    auto process_kv_blocks = [&](uint32_t layer_idx, KVCacheBlockManager* manager, const char* kv_type_name) -> bool {
+    auto process_kv_blocks = [&](const std::string& output_name,
+                                 const std::string& stream_desc,
+                                 KVCacheBlockManager* manager) -> bool {
         uint32_t start_pos = current_position;
         uint32_t end_pos = current_position + num_new_tokens;
         uint32_t start_block_idx = start_pos / m_block_size;
@@ -726,15 +812,12 @@ bool LLMBlockKVCacheStrategy::redirect_prefill_outputs_to_new_blocks(
         while (allocated_blocks.size() < blocks_needed) {
             auto new_block_id = manager->allocate_block();
             OPENVINO_ASSERT(new_block_id.has_value(),
-                            "Failed to allocate ",
-                            kv_type_name,
-                            " block for layer ",
-                            layer_idx);
+                            "Failed to allocate block for ",
+                            stream_desc);
             total_blocks_allocated++;
             allocated_blocks = manager->get_allocated_blocks();
         }
 
-        std::string output_name = "present." + std::to_string(layer_idx) + "." + kv_type_name;
         auto port_it = prefill_out_ports.find(output_name);
         if (port_it != prefill_out_ports.end()) {
             uint32_t target_block_id = allocated_blocks[start_block_idx];
@@ -744,19 +827,25 @@ bool LLMBlockKVCacheStrategy::redirect_prefill_outputs_to_new_blocks(
             uint32_t block_start_pos = start_block_idx * m_block_size;
             manager->update_block_tokens(target_block_id, end_pos - block_start_pos);
             total_outputs_bound++;
-            LOG_VERB("Bound " << kv_type_name << " output layer " << layer_idx << " to block_" << start_block_idx
+            LOG_VERB("Bound " << stream_desc << " output to block_" << start_block_idx
                               << " (zero-copy, " << num_new_tokens << " tokens, metadata updated)");
         }
         return true;
     };
 
     for (const auto& [layer_idx, layer_managers] : m_kv_cache_block_managers) {
+        const std::string layer_str = std::to_string(layer_idx);
         if (layer_managers.key_manager) {
-            process_kv_blocks(layer_idx, layer_managers.key_manager.get(), "key");
+            process_kv_blocks("present." + layer_str + ".key", "key layer " + layer_str, layer_managers.key_manager.get());
         }
         if (layer_managers.value_manager) {
-            process_kv_blocks(layer_idx, layer_managers.value_manager.get(), "value");
+            process_kv_blocks("present." + layer_str + ".value",
+                              "value layer " + layer_str,
+                              layer_managers.value_manager.get());
         }
+    }
+    for (const auto& [root, stream] : m_aux_streams) {
+        process_kv_blocks(stream.present_name, root, stream.manager.get());
     }
 
     LOG_DEBUG("Pre-binding complete: allocated=" << total_blocks_allocated << " blocks, bound=" << total_outputs_bound
@@ -785,22 +874,27 @@ void LLMBlockKVCacheStrategy::restore_prefill_output_buffers(
                     "Original output tensors were not snapshotted during on_initialize().");
     LOG_DEBUG("=== Restoring Original Output Tensors (Non-Zero-Copy Path) ===");
     size_t total_restored = 0;
+    auto restore = [&](const std::string& output_name) {
+        auto orig_it = m_prefill_original_output_tensors.find(output_name);
+        auto port_it = prefill_out_ports.find(output_name);
+        if (orig_it == m_prefill_original_output_tensors.end() || port_it == prefill_out_ports.end()) {
+            return;
+        }
+        auto current_tensor = prefill_request->get_tensor(port_it->second);
+        if (current_tensor->data() != orig_it->second->data()) {
+            prefill_request->set_tensor(port_it->second, orig_it->second);
+            total_restored++;
+            LOG_VERB("Restored original buffer for " << output_name);
+        }
+    };
     for (const auto& [layer_idx, layer_managers] : m_kv_cache_block_managers) {
         const std::string layer_str = std::to_string(layer_idx);
         for (const char* kv_type : {"key", "value"}) {
-            std::string output_name = "present." + layer_str + "." + kv_type;
-            auto orig_it = m_prefill_original_output_tensors.find(output_name);
-            auto port_it = prefill_out_ports.find(output_name);
-            if (orig_it == m_prefill_original_output_tensors.end() || port_it == prefill_out_ports.end()) {
-                continue;
-            }
-            auto current_tensor = prefill_request->get_tensor(port_it->second);
-            if (current_tensor->data() != orig_it->second->data()) {
-                prefill_request->set_tensor(port_it->second, orig_it->second);
-                total_restored++;
-                LOG_VERB("Restored original buffer for " << output_name);
-            }
+            restore("present." + layer_str + "." + kv_type);
         }
+    }
+    for (const auto& [root, stream] : m_aux_streams) {
+        restore(stream.present_name);
     }
     LOG_DEBUG("Restore complete: restored=" << total_restored << " tensors");
 }
@@ -895,6 +989,14 @@ void LLMBlockKVCacheStrategy::update_generate_bindings(uint32_t old_num_tokens,
             update_blocks(layer_idx, layer_managers.value_manager.get(), layer_helpers.value_helper, kv_dim, "value");
         }
     }
+    const auto& aux_helpers = m_variant_aux_binding_helpers.at(kvcache_request);
+    for (const auto& [root, stream] : m_aux_streams) {
+        update_blocks(0u,
+                      stream.manager.get(),
+                      aux_helpers.at(root),
+                      kv_seq_dim(stream.is_value, kvcache_desc.v_tensors_transposed_gen, kvcache_desc.dim),
+                      root.c_str());
+    }
 }
 
 // ============================================================================
@@ -944,22 +1046,24 @@ void LLMBlockKVCacheStrategy::copy_outputs_to_blocks(const std::shared_ptr<ov::I
     for (std::size_t i = LLMInferBaseRequest::layer_ids::kStartOutputKVCacheLayers; i < compiled->outputs().size();
          ++i) {
         const auto& output_name = compiled->outputs()[i].get_any_name();
-        // Classify output port via pre-computed map (avoids per-call regex).
-        auto info_it = m_output_kv_info.find(output_name);
-        if (info_it == m_output_kv_info.end()) {
+        // Classify output port via pre-computed maps (avoids per-call regex).
+        KVCacheBlockManager* block_manager = nullptr;
+        uint32_t kv_dim = kvcache_desc.dim;
+        if (auto info_it = m_output_kv_info.find(output_name); info_it != m_output_kv_info.end()) {
+            auto it = m_kv_cache_block_managers.find(info_it->second.layer_idx);
+            if (it == m_kv_cache_block_managers.end()) {
+                continue;
+            }
+            const bool is_key = info_it->second.is_key;
+            block_manager = (is_key ? it->second.key_manager : it->second.value_manager).get();
+            kv_dim = kv_seq_dim(!is_key, v_transposed, kvcache_desc.dim);
+        } else if (auto aux_it = m_aux_output_to_root.find(output_name); aux_it != m_aux_output_to_root.end()) {
+            const auto& stream = m_aux_streams.at(aux_it->second);
+            block_manager = stream.manager.get();
+            kv_dim = kv_seq_dim(stream.is_value, v_transposed, kvcache_desc.dim);
+        } else {
             continue;
         }
-        const bool is_key = info_it->second.is_key;
-        const uint32_t layer_idx = info_it->second.layer_idx;
-
-        auto it = m_kv_cache_block_managers.find(layer_idx);
-        if (it == m_kv_cache_block_managers.end()) {
-            continue;
-        }
-
-        auto& layer_managers = it->second;
-        auto& block_manager = is_key ? layer_managers.key_manager : layer_managers.value_manager;
-        const uint32_t kv_dim = (!is_key && v_transposed) ? 3u : kvcache_desc.dim;
 
         auto src_tensor = request->get_tensor(src_ports.at(output_name));
         uint32_t src_seq_len = static_cast<uint32_t>(src_tensor->get_shape()[kv_dim]);
@@ -1030,8 +1134,9 @@ void LLMBlockKVCacheStrategy::create_block_managers_and_helpers() {
     static const std::regex layer_regex(R"(past_key_values\.(\d+)\.)");
     for (const auto& [name, cp] : m_prefill_classified_in_ports) {
         namespace uu = ov::npuw::util;
-        if (cp.kind == ov::npuw::BlockParamKind::Skip) {
-            continue;  // non-KV or contiguous param
+        if (cp.kind == ov::npuw::BlockParamKind::Skip || cp.kind == ov::npuw::BlockParamKind::AuxBlock ||
+            cp.kind == ov::npuw::BlockParamKind::AuxTail) {
+            continue;  // non-KV, contiguous or quantization-parameter param
         }
         std::smatch match;
         if (!std::regex_search(name, match, layer_regex) || match.size() <= 1) {
@@ -1114,10 +1219,43 @@ void LLMBlockKVCacheStrategy::create_block_managers_and_helpers() {
         m_kv_cache_block_managers[layer_idx] = std::move(layer_managers);
     }
 
+    // -------------------------------------------------------------------------
+    // Quantization-parameter streams of a compressed KV cache: one block pool per DynamicQuantize
+    // root, shaped after its block_0 port. Block ids are never assumed equal to the data block ids.
+    // -------------------------------------------------------------------------
+    for (const auto& [name, cp] : m_prefill_classified_in_ports) {
+        if (cp.kind != ov::npuw::BlockParamKind::AuxBlock && cp.kind != ov::npuw::BlockParamKind::AuxTail) {
+            continue;
+        }
+        const auto dq = ov::npuw::util::parseDQBlockParam(name);
+        OPENVINO_ASSERT(dq.has_value(), "NPUW block KV cache: unexpected quantization parameter port: ", name);
+        if (m_aux_streams.count(dq->root)) {
+            continue;
+        }
+        const std::string block0_name = dq->root + "_block_0";
+        OPENVINO_ASSERT(m_prefill_classified_in_ports.count(block0_name),
+                        "NPUW block KV cache: ",
+                        dq->root,
+                        " has blocks but no block_0. SplitKVCacheIntoBlocks transformation may be broken.");
+        const auto& first_port = m_prefill_classified_in_ports.at(block0_name).port;
+        AuxBlockStream stream;
+        stream.present_name = dq->present;
+        stream.is_value = dq->is_value;
+        stream.manager = std::make_unique<KVCacheBlockManager>(block_size,
+                                                               max_blocks,
+                                                               first_port.get_shape(),
+                                                               first_port.get_element_type(),
+                                                               m_req.m_pre_alloc_device,
+                                                               compiled_model->get_plugin());
+        m_aux_output_to_root[stream.present_name] = dq->root;
+        m_aux_streams.emplace(dq->root, std::move(stream));
+    }
+
     // Build binding helpers for every generate variant in one scan per variant
     // (no per-layer index enumeration).
     for (const auto& [generate_request, classified] : m_gen_classified_in_ports) {
         m_variant_block_binding_helpers[generate_request] = build_variant_layer_helpers(classified, block_size);
+        m_variant_aux_binding_helpers[generate_request] = build_variant_aux_helpers(classified, block_size);
     }
 }
 

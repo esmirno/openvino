@@ -517,6 +517,10 @@ void ov::npuw::LLMInferRequest::init_past_name_lists() {
                 m_swa_past_names.push_back(name);
                 break;
             }
+            if (ov::npuw::util::isDQScaleOrZPBlockParam(name)) {
+                // Block-split scale/zp inputs are owned by the block KV cache strategy.
+                break;
+            }
             if (ov::npuw::util::isKVCacheName(name)) {
                 m_kvcache_past_names.push_back(name);
                 break;

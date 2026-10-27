@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -36,6 +37,8 @@ enum class BlockParamKind {
     KeyBlock,    ///< numbered key block   (key_block_N)
     ValueBlock,  ///< numbered value block (value_block_N)
     TailBlock,   ///< block_tail port — use isPastKeyParam() to distinguish key vs value
+    AuxBlock,    ///< numbered quantization-parameter block (DynamicQuantize/N/.../{scale|zp}_block_N)
+    AuxTail,     ///< quantization-parameter block_tail port
     Skip,        ///< not a block KV param (contiguous KV or unrelated port)
 };
 
@@ -43,6 +46,15 @@ enum class BlockParamKind {
 struct LayerBlockManagers {
     std::unique_ptr<KVCacheBlockManager> key_manager;
     std::unique_ptr<KVCacheBlockManager> value_manager;
+};
+
+/// @brief Block pool of one quantization-parameter stream (key scale, key zero point or value scale)
+/// of a compressed KV cache. Streams are keyed by the DynamicQuantize root name, e.g.
+/// "DynamicQuantize/3/past_key_values/key/scale", and mirror the data blocks one to one.
+struct AuxBlockStream {
+    std::string present_name;  ///< matching prefill/generate output, e.g. "DynamicQuantize/3/present/key/scale"
+    bool is_value = false;     ///< value (true) or key (false) cache, selects the sequence dimension
+    std::unique_ptr<KVCacheBlockManager> manager;
 };
 
 /// @brief Helper for block binding: determines whether a block uses zero-copy numbered binding
@@ -210,6 +222,16 @@ private:
     // Pre-computed binding helpers: variant_request → layer_idx → {key_helper, value_helper}
     std::unordered_map<std::shared_ptr<ov::IAsyncInferRequest>, std::unordered_map<uint32_t, LayerBlockBindingHelpers>>
         m_variant_block_binding_helpers;
+
+    // Quantization-parameter block pools of a compressed KV cache: DQ root name → stream.
+    // Empty for an uncompressed KV cache.
+    std::map<std::string, AuxBlockStream> m_aux_streams;
+    // present output name → DQ root name of the stream it feeds
+    std::unordered_map<std::string, std::string> m_aux_output_to_root;
+
+    // Pre-computed aux binding helpers: variant_request → DQ root name → helper
+    std::unordered_map<std::shared_ptr<ov::IAsyncInferRequest>, std::map<std::string, BlockBindingHelper>>
+        m_variant_aux_binding_helpers;
 
     // output_name → {layer_idx, is_key}: pre-computed in on_initialize()
     std::unordered_map<std::string, OutputKVInfo> m_output_kv_info;

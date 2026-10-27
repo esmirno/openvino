@@ -1478,13 +1478,20 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     if (m_cfg.get<::intel_npu::NPUW_LLM_ENABLE_BLOCK_BASED_KV_CACHE>()) {
         const bool integer_kv_cache =
             kv_kache_storage_type == ov::element::i8 || kv_kache_storage_type == ov::element::u8;
-        OPENVINO_ASSERT(!integer_kv_cache,
-                        "NPUW_LLM_ENABLE_BLOCK_BASED_KV_CACHE cannot be combined with integer KV-cache precision.");
+        // A compressed block KV cache keeps its scales and zero points in per-block parameters
+        // (see SplitKVCacheIntoBlocks). The Pyramid and HFA attention paths do not consume those
+        // yet, so only STATIC attention supports the combination for now.
+        OPENVINO_ASSERT(!integer_kv_cache || !(prefill_attn_hfa || prefill_attn_pyramid),
+                        "NPUW_LLM_ENABLE_BLOCK_BASED_KV_CACHE with integer KV-cache precision is not yet supported "
+                        "with HFA or Pyramid prefill attention. Use STATIC attention.");
+        OPENVINO_ASSERT(!generate_attn_dyn,
+                        "NPUW_LLM_ENABLE_BLOCK_BASED_KV_CACHE does not support DYNAMIC generate attention. "
+                        "Use STATIC, Pyramid or HFA attention.");
         OPENVINO_ASSERT(!m_enable_prefix_caching,
                         "NPUW_LLM_ENABLE_BLOCK_BASED_KV_CACHE and NPUW_LLM_ENABLE_PREFIX_CACHING "
                         "cannot be enabled simultaneously — this combination is not yet supported. "
                         "Please disable one of the two options.");
-        if (m_use_chunk_prefill && !m_is_embedding && (prefill_attn_hfa || prefill_attn_pyramid)) {
+        if (m_use_chunk_prefill && !m_is_embedding && !prefill_attn_dyn) {
             const uint32_t block_size = static_cast<uint32_t>(m_prefill_chunk_size);
 
             LOG_DEBUG("Applying SplitKVCacheIntoBlocks (block_size=" << block_size << ")");
@@ -1514,13 +1521,13 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
             if (!all_transformed) {
                 OPENVINO_THROW("NPUW_LLM_ENABLE_BLOCK_BASED_KV_CACHE=YES: "
                                "SplitKVCacheIntoBlocks had no effect on one or more models. "
-                               "Ensure the model uses HFA or Pyramid attention pattern.");
+                               "Ensure the model uses an SDPA-based attention pattern.");
             }
             m_is_block_kv_cache = true;
         } else {
             LOG_WARN("NPUW_LLM_ENABLE_BLOCK_BASED_KV_CACHE=YES was requested but could not be applied. "
                      "Block-based KV cache requires: chunk prefill enabled, "
-                     "HFA or Pyramid attention, and a non-embedding model. "
+                     "non-DYNAMIC prefill attention, and a non-embedding model. "
                      "Falling back to monolithic (continuous) KV cache.");
         }
     }

@@ -1259,6 +1259,30 @@ bool ov::npuw::util::isDQScaleOrZPValue(const std::string& str) {
     return std::regex_match(str, pattern);
 }
 
+std::optional<ov::npuw::util::DQBlockParamName> ov::npuw::util::parseDQBlockParam(const std::string& str) {
+    static const std::regex pattern(
+        R"((DynamicQuantize/(\d+)/past_key_values/(key|value)/(?:scale|zp))_block_(\d+|tail))");
+    std::smatch match;
+    if (!std::regex_match(str, match, pattern)) {
+        return std::nullopt;
+    }
+    DQBlockParamName result;
+    result.root = match[1].str();
+    result.is_value = match[3].str() == "value";
+    result.is_tail = match[4].str() == "tail";
+    if (!result.is_tail) {
+        result.block_idx = static_cast<uint32_t>(std::stoul(match[4].str()));
+    }
+    result.present = result.root;
+    const std::string past = "/past_key_values/";
+    result.present.replace(result.present.find(past), past.size(), "/present/");
+    return result;
+}
+
+bool ov::npuw::util::isDQScaleOrZPBlockParam(const std::string& str) {
+    return parseDQBlockParam(str).has_value();
+}
+
 bool ov::npuw::util::isRestoredPastKeyValueParam(const std::string& str) {
     // Match badly handled KVCache states by StatefulToStateless pass for Whisper.
     static const std::regex restored_pattern(

@@ -496,11 +496,10 @@ TEST_F(LLMInferRequestVariantSwitchTest, BlockKvVariantsExposeCompatibleBindings
     EXPECT_EQ(small_value_block0, large_value_block0);
 }
 
-// Block-based KV cache relies on SplitKVCacheIntoBlocks, whose pattern no longer matches once the
-// KV cache is precision-converted to i8. The two features are mutually exclusive, so enabling both
-// must be rejected at compile time (guards against silently producing an unblocked / unquantized
-// model). This is why the block strategy never has to handle quantized aux tensors.
-TEST_F(LLMInferRequestVariantSwitchTest, BlockKvCacheRejectsQuantizedKvCache) {
+// A compressed block KV cache keeps its scales and zero points in per-block parameters that the
+// Pyramid and HFA attention paths do not consume yet, so those combinations must be rejected at
+// compile time rather than silently producing a model with unbound quantization parameters.
+TEST_F(LLMInferRequestVariantSwitchTest, BlockKvCacheRejectsQuantizedKvCacheWithPyramidAttention) {
     VariantSwitchFactory factory;
     try {
         create_compiled_model({{"NPUW_LLM_PREFILL_HINT", "DYNAMIC"},
@@ -510,11 +509,56 @@ TEST_F(LLMInferRequestVariantSwitchTest, BlockKvCacheRejectsQuantizedKvCache) {
                                {"NPUW_LLM_ENABLE_BLOCK_BASED_KV_CACHE", "YES"},
                                {ov::hint::kv_cache_precision.name(), ov::element::i8}},
                               factory);
-        FAIL() << "Expected block-based KV cache with integer KV-cache precision to be rejected";
+        FAIL() << "Expected block-based compressed KV cache with Pyramid attention to be rejected";
     } catch (const ov::Exception& ex) {
-        EXPECT_NE(std::string(ex.what()).find("cannot be combined with integer KV-cache precision"), std::string::npos)
+        EXPECT_NE(std::string(ex.what()).find("not yet supported with HFA or Pyramid"), std::string::npos)
             << ex.what();
     }
+}
+
+// With STATIC attention a compressed KV cache is split into blocks together with its scale and
+// zero-point parameters: every data block has matching key scale/zp and value scale blocks, and
+// no contiguous quantization parameter is left behind.
+TEST_F(LLMInferRequestVariantSwitchTest, BlockKvCacheSplitsQuantizedAuxParametersWithStaticAttention) {
+    VariantSwitchFactory factory;
+    auto compiled = create_compiled_model({{"NPUW_LLM_PREFILL_HINT", "DYNAMIC"},
+                                           {"NPUW_LLM_PREFILL_CHUNK_SIZE", "512"},
+                                           {"NPUW_LLM_PREFILL_ATTENTION_HINT", "STATIC"},
+                                           {"NPUW_LLM_GENERATE_ATTENTION_HINT", "STATIC"},
+                                           {"NPUW_LLM_ENABLE_BLOCK_BASED_KV_CACHE", "YES"},
+                                           {ov::hint::kv_cache_precision.name(), ov::element::i8}},
+                                          factory);
+    ASSERT_NE(compiled, nullptr);
+    ASSERT_TRUE(LLMVariantSwitchTestAccess::is_block_kv_cache(compiled));
+
+    auto variant = std::dynamic_pointer_cast<FakeSubCompiledModel>(LLMVariantSwitchTestAccess::generate_variant(compiled, 0u));
+    ASSERT_NE(variant, nullptr);
+    const auto model = variant->get_runtime_model();
+    ASSERT_NE(model, nullptr);
+
+    size_t key_scale_blocks = 0, key_zp_blocks = 0, value_scale_blocks = 0, data_key_blocks = 0;
+    for (const auto& input : model->inputs()) {
+        const auto& name = input.get_any_name();
+        EXPECT_FALSE(ov::npuw::util::isDQScaleOrZPKey(name)) << "contiguous aux left: " << name;
+        EXPECT_FALSE(ov::npuw::util::isDQScaleOrZPValue(name)) << "contiguous aux left: " << name;
+        if (const auto dq = ov::npuw::util::parseDQBlockParam(name); dq && !dq->is_tail && dq->block_idx == 0u) {
+            if (!dq->is_value && dq->root.find("/scale") != std::string::npos) {
+                ++key_scale_blocks;
+            } else if (!dq->is_value) {
+                ++key_zp_blocks;
+            } else {
+                ++value_scale_blocks;
+            }
+        }
+        if (name.find(".key_block_0") != std::string::npos) {
+            ++data_key_blocks;
+        }
+    }
+    EXPECT_GT(data_key_blocks, 0u);
+    EXPECT_EQ(key_scale_blocks, data_key_blocks);
+    // The i8 hint quantizes keys symmetrically (no zero point); asymmetric keys carry one per block.
+    EXPECT_TRUE(key_zp_blocks == 0u || key_zp_blocks == data_key_blocks) << key_zp_blocks;
+    EXPECT_EQ(value_scale_blocks, data_key_blocks);
 }
 
 // The deserializer restores m_kvcache_sizes and the generate-variant count as two independent blob

@@ -436,6 +436,18 @@ bool isPastValueParam(const std::string& str);
 bool isDQScaleOrZPKey(const std::string& str);
 bool isDQScaleOrZPValue(const std::string& str);
 
+// Block-split variants of the DynamicQuantize scale/zp parameters, produced by SplitKVCacheIntoBlocks:
+//   DynamicQuantize/N/past_key_values/{key|value}/{scale|zp}_block_{i|tail}
+struct DQBlockParamName {
+    std::string root;        // DynamicQuantize/N/past_key_values/{key|value}/{scale|zp}
+    std::string present;     // DynamicQuantize/N/present/{key|value}/{scale|zp}
+    bool is_value = false;   // value (true) or key (false) cache
+    bool is_tail = false;    // *_block_tail
+    uint32_t block_idx = 0;  // valid only when !is_tail
+};
+std::optional<DQBlockParamName> parseDQBlockParam(const std::string& str);
+bool isDQScaleOrZPBlockParam(const std::string& str);
+
 // To remove input KV params that got badly matched in StatefulToStateless pass
 // in Whisper model.
 bool isRestoredPastKeyValueParam(const std::string& str);
