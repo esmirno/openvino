@@ -1476,14 +1476,6 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     // Apply block-based KV cache transformation for chunk prefill after ShapeOfParameter
     // This ensures ShapeOf nodes are already regularized before transformation
     if (m_cfg.get<::intel_npu::NPUW_LLM_ENABLE_BLOCK_BASED_KV_CACHE>()) {
-        const bool integer_kv_cache =
-            kv_kache_storage_type == ov::element::i8 || kv_kache_storage_type == ov::element::u8;
-        // A compressed block KV cache keeps its scales and zero points in per-block parameters
-        // (see SplitKVCacheIntoBlocks). The Pyramid and HFA attention paths do not consume those
-        // yet, so only STATIC attention supports the combination for now.
-        OPENVINO_ASSERT(!integer_kv_cache || !prefill_attn_hfa,
-                        "NPUW_LLM_ENABLE_BLOCK_BASED_KV_CACHE with integer KV-cache precision is not yet supported "
-                        "with HFA prefill attention. Use STATIC or Pyramid attention.");
         OPENVINO_ASSERT(!generate_attn_dyn,
                         "NPUW_LLM_ENABLE_BLOCK_BASED_KV_CACHE does not support DYNAMIC generate attention. "
                         "Use STATIC, Pyramid or HFA attention.");

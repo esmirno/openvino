@@ -11,6 +11,7 @@
 
 #include "common_test_utils/node_builders/constant.hpp"
 #include "npuw_transformations/detect_causal_mask.hpp"
+#include "npuw_transformations/split_kvcache_into_blocks.hpp"
 #include "openvino/op/add.hpp"
 #include "openvino/op/concat.hpp"
 #include "openvino/op/convert.hpp"
@@ -1086,4 +1087,81 @@ TEST(HostFlashAttentionInt8KVTest, CompiledInfoOfAnUncompressedModelHasNoDequant
     ov::npuw::compiled::HostFlashAttention compiled(*func);
     EXPECT_EQ(compiled._sdpa_attention_info.quant_input_count(), 0u);
     EXPECT_TRUE(compiled._sdpa_attention_info._sdpa_indices.past_key_scale_blocks.empty());
+}
+
+// ============================================================================
+// int8-compressed BLOCK-split past KV cache (SplitKVCacheIntoBlocks over the compressed model)
+// ============================================================================
+// Every past block carries its own dequantization chain; the scale / zero-point indices must come out
+// per block, in Concat input order, parallel to the data block indices.
+
+namespace {
+
+std::shared_ptr<ov::Model> build_block_split_int8_model(bool key_asymmetric, uint32_t block_size) {
+    auto model = build_sdpa_model_int8_kv(key_asymmetric);
+    // The value cache of this fixture is pre-transposed, so the sequence axis is the last one.
+    ov::npuw::pass::SplitKVCacheIntoBlocks(block_size, /*v_transposed=*/true).run_on_model(model);
+    model->validate_nodes_and_infer_types();
+    return model;
+}
+
+size_t param_index_of(const std::shared_ptr<ov::Model>& model, const std::string& name) {
+    for (size_t i = 0; i < model->get_parameters().size(); ++i) {
+        if (model->get_parameters()[i]->get_friendly_name() == name) {
+            return i;
+        }
+    }
+    return std::numeric_limits<size_t>::max();
+}
+
+}  // namespace
+
+TEST(HostFlashAttentionInt8BlockKVTest, DequantizationIndicesAreCollectedPerBlock) {
+    constexpr uint32_t block = static_cast<uint32_t>(QUERY_SIZE);
+    constexpr size_t blocks = PAST_LEN / QUERY_SIZE;
+    auto model = build_block_split_int8_model(/*key_asymmetric=*/true, block);
+    auto result = ov::npuw::function::HostFlashAttention::from(model, false);
+    ASSERT_TRUE(result.has_value());
+
+    EXPECT_EQ(result->_past_key_block_indices.size(), blocks);
+    EXPECT_EQ(result->_past_key_scale_indices.size(), blocks);
+    EXPECT_EQ(result->_past_key_zp_indices.size(), blocks);
+    EXPECT_EQ(result->_past_value_block_indices.size(), blocks);
+    EXPECT_EQ(result->_past_value_scale_indices.size(), blocks);
+    EXPECT_TRUE(result->_past_value_zp_indices.empty());
+
+    for (size_t i = 0; i < blocks; ++i) {
+        const auto sfx = "_block_" + std::to_string(i);
+        EXPECT_EQ(result->_past_key_block_indices.at(i), param_index_of(model, "past_key_values.0.key" + sfx));
+        EXPECT_EQ(result->_past_key_scale_indices.at(i),
+                  param_index_of(model, "DynamicQuantize/0/past_key_values/key/scale" + sfx));
+        EXPECT_EQ(result->_past_key_zp_indices.at(i),
+                  param_index_of(model, "DynamicQuantize/0/past_key_values/key/zp" + sfx));
+        EXPECT_EQ(result->_past_value_block_indices.at(i), param_index_of(model, "past_key_values.0.value" + sfx));
+        EXPECT_EQ(result->_past_value_scale_indices.at(i),
+                  param_index_of(model, "DynamicQuantize/0/past_key_values/value/scale" + sfx));
+    }
+}
+
+TEST(HostFlashAttentionInt8BlockKVTest, SymmetricKeyHasNoZeroPointBlocks) {
+    auto model = build_block_split_int8_model(/*key_asymmetric=*/false, static_cast<uint32_t>(QUERY_SIZE));
+    auto result = ov::npuw::function::HostFlashAttention::from(model, false);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->_past_key_scale_indices.size(), PAST_LEN / QUERY_SIZE);
+    EXPECT_TRUE(result->_past_key_zp_indices.empty());
+    EXPECT_EQ(result->_regular_tile_quant_index_map.count(HFATileQuantInputId::K_ZP_TILE), 0u);
+}
+
+TEST(HostFlashAttentionInt8BlockKVTest, CompiledInfoCarriesThePerBlockDequantizationIndices) {
+    auto func = ov::npuw::function::HostFlashAttention::from(
+        build_block_split_int8_model(/*key_asymmetric=*/true, static_cast<uint32_t>(QUERY_SIZE)),
+        false);
+    ASSERT_TRUE(func.has_value());
+    ov::npuw::compiled::HostFlashAttention compiled(*func);
+    const auto& sdpa = compiled._sdpa_attention_info._sdpa_indices;
+    EXPECT_EQ(sdpa.past_key_scale_blocks, func->_past_key_scale_indices);
+    EXPECT_EQ(sdpa.past_key_zp_blocks, func->_past_key_zp_indices);
+    EXPECT_EQ(sdpa.past_value_scale_blocks, func->_past_value_scale_indices);
+    EXPECT_EQ(sdpa.past_key_scale_blocks.size(), PAST_LEN / QUERY_SIZE);
+    EXPECT_EQ(compiled._sdpa_attention_info.quant_input_count(), 3u);
 }
