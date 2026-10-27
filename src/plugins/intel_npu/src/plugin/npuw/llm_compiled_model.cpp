@@ -1481,9 +1481,9 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         // A compressed block KV cache keeps its scales and zero points in per-block parameters
         // (see SplitKVCacheIntoBlocks). The Pyramid and HFA attention paths do not consume those
         // yet, so only STATIC attention supports the combination for now.
-        OPENVINO_ASSERT(!integer_kv_cache || !(prefill_attn_hfa || prefill_attn_pyramid),
+        OPENVINO_ASSERT(!integer_kv_cache || !prefill_attn_hfa,
                         "NPUW_LLM_ENABLE_BLOCK_BASED_KV_CACHE with integer KV-cache precision is not yet supported "
-                        "with HFA or Pyramid prefill attention. Use STATIC attention.");
+                        "with HFA prefill attention. Use STATIC or Pyramid attention.");
         OPENVINO_ASSERT(!generate_attn_dyn,
                         "NPUW_LLM_ENABLE_BLOCK_BASED_KV_CACHE does not support DYNAMIC generate attention. "
                         "Use STATIC, Pyramid or HFA attention.");

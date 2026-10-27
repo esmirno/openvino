@@ -15,6 +15,7 @@
 #include "openvino/op/multiply.hpp"
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/reshape.hpp"
+#include "openvino/op/subtract.hpp"
 #include "openvino/op/transpose.hpp"
 #include "openvino/op/unsqueeze.hpp"
 #include "openvino/op/util/op_types.hpp"
@@ -192,8 +193,11 @@ static void collect_concat_block_indices(const std::shared_ptr<ov::Model>& model
     const size_t n = concat_node->get_input_size();
     for (size_t i = 0; i + 1 < n; ++i) {
         auto node = concat_node->get_input_node_shared_ptr(i);
-        if (auto cvt = std::dynamic_pointer_cast<ov::op::v0::Convert>(node)) {
-            node = cvt->input_value(0).get_node_shared_ptr();
+        // The data operand is input 0 of every node of the (optional) per-block dequantization
+        // chain Multiply -> [Subtract] -> Convert of a compressed KV cache.
+        while (ov::is_type<ov::op::v0::Convert>(node) || ov::is_type<ov::op::v1::Subtract>(node) ||
+               ov::is_type<ov::op::v1::Multiply>(node)) {
+            node = node->input_value(0).get_node_shared_ptr();
         }
         if (auto param = std::dynamic_pointer_cast<ov::op::v0::Parameter>(node)) {
             out.push_back(static_cast<size_t>(model->get_parameter_index(param)));
@@ -222,8 +226,9 @@ static std::optional<size_t> find_past_concat_input_index(const std::shared_ptr<
                               : ov::npuw::util::isPastKeyValuesValueContiguous(name).has_value();
             }
             if (ov::is_type<ov::op::v0::Convert>(node) || ov::is_type<ov::op::v1::Multiply>(node) ||
-                ov::is_type<ov::op::v1::Reshape>(node) || ov::is_type<ov::op::v1::Transpose>(node) ||
-                ov::is_type<ov::op::v0::Unsqueeze>(node) || ov::is_type<ov::op::v3::Broadcast>(node)) {
+                ov::is_type<ov::op::v1::Subtract>(node) || ov::is_type<ov::op::v1::Reshape>(node) ||
+                ov::is_type<ov::op::v1::Transpose>(node) || ov::is_type<ov::op::v0::Unsqueeze>(node) ||
+                ov::is_type<ov::op::v3::Broadcast>(node)) {
                 if (node->get_input_size() == 0) {
                     break;
                 }
@@ -336,22 +341,24 @@ std::optional<PyramidModelResult> process_pyramid_model(const std::shared_ptr<ov
                 auto src_output = concat->input_value(i);
                 auto src_node = src_output.get_node_shared_ptr();
 
-                // SplitKVCacheIntoBlocks may insert a Convert node between the block
-                // Parameter and the Concat; unwrap it to reach the Parameter.
-                std::shared_ptr<ov::op::v0::Parameter> block_param;
-                if (auto cvt = std::dynamic_pointer_cast<ov::op::v0::Convert>(src_node)) {
-                    block_param =
-                        std::dynamic_pointer_cast<ov::op::v0::Parameter>(cvt->input_value(0).get_node_shared_ptr());
-                } else {
-                    block_param = std::dynamic_pointer_cast<ov::op::v0::Parameter>(src_node);
-                }
-
                 if (i < num_blocks_needed) {
                     new_inputs.push_back(src_output);  // keep
                 } else {
-                    if (block_param) {
-                        params_to_remove.push_back(block_param);
-                        LOG_DEBUG("  Dropping block param: " << block_param->get_friendly_name());
+                    // A block is either a bare Parameter, Parameter -> Convert, or the private
+                    // dequantization chain of a compressed KV cache (data, scale and zero-point
+                    // Parameters). Every Parameter in that cone belongs to the dropped block.
+                    std::vector<std::shared_ptr<ov::Node>> stack{src_node};
+                    while (!stack.empty()) {
+                        auto cur = stack.back();
+                        stack.pop_back();
+                        if (auto param = std::dynamic_pointer_cast<ov::op::v0::Parameter>(cur)) {
+                            params_to_remove.push_back(param);
+                            LOG_DEBUG("  Dropping block param: " << param->get_friendly_name());
+                            continue;
+                        }
+                        for (const auto& in : cur->input_values()) {
+                            stack.push_back(in.get_node_shared_ptr());
+                        }
                     }
                 }
             }
@@ -874,6 +881,14 @@ std::optional<PyramidAttention> PyramidAttention::from(const std::shared_ptr<ov:
     pyramid_attention.past_key_block_global_param_indices = std::move(block_key_global_indices);
     pyramid_attention.past_value_block_global_param_indices = std::move(block_val_global_indices);
     pyramid_attention.global_mask_idx = global_mask_idx;
+    if (is_block_split) {
+        const auto& model_params = model->get_parameters();
+        for (size_t i = 0; i < model_params.size(); ++i) {
+            if (ov::npuw::util::isDQScaleOrZPBlockParam(model_params[i]->get_friendly_name())) {
+                pyramid_attention.past_aux_block_global_param_indices.push_back(i);
+            }
+        }
+    }
 
     LOG_INFO("Returning pyramid attention with " << pyramid_models.size() << " models");
     LOG_INFO("  Query length: " << pyramid_attention._query_length);
@@ -1166,6 +1181,9 @@ std::shared_ptr<PyramidAttention> PyramidAttention::make(const function::Pyramid
         obj->past_value_block_global_param_indices = gv;
         obj->_key_block_global_set = std::unordered_set<size_t>(gk.begin(), gk.end());
         obj->_value_block_global_set = std::unordered_set<size_t>(gv.begin(), gv.end());
+        obj->past_aux_block_global_param_indices = func_pyramid.past_aux_block_global_param_indices;
+        obj->_aux_block_global_set = std::unordered_set<size_t>(obj->past_aux_block_global_param_indices.begin(),
+                                                                obj->past_aux_block_global_param_indices.end());
         obj->global_mask_idx = func_pyramid.global_mask_idx;
         obj->_attention_infos.reserve(num_models);
         obj->_context_lengths.reserve(num_models);

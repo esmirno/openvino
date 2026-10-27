@@ -618,11 +618,13 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                             auto it = param_port_map.find(input_idx);
                             if (it == param_port_map.end()) {
                                 NPUW_ASSERT((pyramid->is_key_block_global_idx(input_idx) ||
-                                             pyramid->is_value_block_global_idx(input_idx)) &&
+                                             pyramid->is_value_block_global_idx(input_idx) ||
+                                             pyramid->is_aux_block_global_idx(input_idx)) &&
                                             "Pyramid block-mode variant is missing a parameter port mapping "
                                             "for a non-block input; process_pyramid_model must populate "
                                             "global_to_local_param_idx for every retained parameter");
-                                // Known KV block, but dropped for this variant — consume silently.
+                                // Known KV block (or its scale / zero point), but dropped for this
+                                // variant — consume silently.
                             } else if (is_mask) {
                                 io.inputs.at(input_idx) = tensor;
                             } else {

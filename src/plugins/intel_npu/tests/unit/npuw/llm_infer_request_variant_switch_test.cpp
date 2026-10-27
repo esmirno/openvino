@@ -498,22 +498,37 @@ TEST_F(LLMInferRequestVariantSwitchTest, BlockKvVariantsExposeCompatibleBindings
 }
 
 // A compressed block KV cache keeps its scales and zero points in per-block parameters that the
-// Pyramid and HFA attention paths do not consume yet, so those combinations must be rejected at
-// compile time rather than silently producing a model with unbound quantization parameters.
-TEST_F(LLMInferRequestVariantSwitchTest, BlockKvCacheRejectsQuantizedKvCacheWithPyramidAttention) {
+// HFA attention path does not consume yet, so that combination must be rejected at compile time
+// rather than silently producing a model with unbound quantization parameters.
+TEST_F(LLMInferRequestVariantSwitchTest, BlockKvCacheRejectsQuantizedKvCacheWithHfaAttention) {
     VariantSwitchFactory factory;
     try {
         create_compiled_model({{"NPUW_LLM_PREFILL_HINT", "DYNAMIC"},
                                {"NPUW_LLM_PREFILL_CHUNK_SIZE", "512"},
-                               {"NPUW_LLM_PREFILL_ATTENTION_HINT", "PYRAMID"},
+                               {"NPUW_LLM_PREFILL_ATTENTION_HINT", "HFA"},
                                {"NPUW_LLM_GENERATE_ATTENTION_HINT", "PYRAMID"},
                                {"NPUW_LLM_ENABLE_BLOCK_BASED_KV_CACHE", "YES"},
                                {ov::hint::kv_cache_precision.name(), ov::element::i8}},
                               factory);
-        FAIL() << "Expected block-based compressed KV cache with Pyramid attention to be rejected";
+        FAIL() << "Expected block-based compressed KV cache with HFA attention to be rejected";
     } catch (const ov::Exception& ex) {
-        EXPECT_NE(std::string(ex.what()).find("not yet supported with HFA or Pyramid"), std::string::npos) << ex.what();
+        EXPECT_NE(std::string(ex.what()).find("not yet supported with HFA"), std::string::npos) << ex.what();
     }
+}
+
+// Pyramid attention consumes the per-block scale / zero-point parameters, so the same
+// configuration compiles with Pyramid prefill attention.
+TEST_F(LLMInferRequestVariantSwitchTest, BlockKvCacheAcceptsQuantizedKvCacheWithPyramidAttention) {
+    VariantSwitchFactory factory;
+    auto compiled = create_compiled_model({{"NPUW_LLM_PREFILL_HINT", "DYNAMIC"},
+                                           {"NPUW_LLM_PREFILL_CHUNK_SIZE", "512"},
+                                           {"NPUW_LLM_PREFILL_ATTENTION_HINT", "PYRAMID"},
+                                           {"NPUW_LLM_GENERATE_ATTENTION_HINT", "PYRAMID"},
+                                           {"NPUW_LLM_ENABLE_BLOCK_BASED_KV_CACHE", "YES"},
+                                           {ov::hint::kv_cache_precision.name(), ov::element::i8}},
+                                          factory);
+    ASSERT_NE(compiled, nullptr);
+    EXPECT_TRUE(LLMVariantSwitchTestAccess::is_block_kv_cache(compiled));
 }
 
 // With STATIC attention a compressed KV cache is split into blocks together with its scale and

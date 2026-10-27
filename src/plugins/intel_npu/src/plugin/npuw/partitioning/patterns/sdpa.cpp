@@ -174,12 +174,49 @@ SDPA::SDPA(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const st
                     |
 */
 
+namespace {
+
+// Per-block dequantization chain of a compressed block KV cache (see SplitKVCacheIntoBlocks):
+//   Multiply(Convert(Param), Param)  or  Multiply(Subtract(Convert(Param), Convert(Param)), Param)
+// Appends the chain's non-Parameter nodes to `nodes` and returns true when `node` is such a chain.
+bool match_block_dequant_chain(const std::shared_ptr<ov::Node>& node, ov::NodeVector& nodes) {
+    auto is_param = [](const ov::Output<ov::Node>& out) {
+        return ov::is_type<ov::op::v0::Parameter>(out.get_node());
+    };
+    auto as_convert_of_param = [&](const ov::Output<ov::Node>& out) {
+        auto cvt = ov::as_type_ptr<ov::op::v0::Convert>(out.get_node_shared_ptr());
+        return (cvt && is_param(cvt->input_value(0))) ? cvt : nullptr;
+    };
+    auto mul = ov::as_type_ptr<ov::op::v1::Multiply>(node);
+    if (!mul || !is_param(mul->input_value(1))) {
+        return false;
+    }
+    ov::NodeVector chain{mul};
+    if (auto sub = ov::as_type_ptr<ov::op::v1::Subtract>(mul->input_value(0).get_node_shared_ptr())) {
+        auto data = as_convert_of_param(sub->input_value(0));
+        auto zp = as_convert_of_param(sub->input_value(1));
+        if (!data || !zp) {
+            return false;
+        }
+        chain.insert(chain.end(), {sub, data, zp});
+    } else if (auto data = as_convert_of_param(mul->input_value(0))) {
+        chain.push_back(data);
+    } else {
+        return false;
+    }
+    nodes.insert(nodes.end(), chain.begin(), chain.end());
+    return true;
+}
+
+}  // namespace
+
 SDPADecomposed::SDPADecomposed(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot,
                                const std::string& isol_tag) {
     // KV-cache Concat predicate: all inputs except the last (current KV slice) must be
-    // Parameters or Parameter-through-Convert.  This guards against matching Eagle-style
-    // concats or DQ-chain concats whose non-last inputs are intermediate nodes such as
-    // Multiply/Subtract produced by a dequantisation path.
+    // Parameters, Parameter-through-Convert, or - for a block-split compressed cache with
+    // at least two past blocks - a per-block dequantization chain.  This guards against
+    // matching Eagle-style concats.  A contiguous compressed cache (one past input) is left
+    // to SDPACompressed.
     auto kv_concat_pred = [](const ov::Output<ov::Node>& output) {
         auto concat = output.get_node_shared_ptr();
         const auto num_inputs = concat->get_input_size();
@@ -193,6 +230,9 @@ SDPADecomposed::SDPADecomposed(const std::shared_ptr<ov::npuw::online::Snapshot>
                 if (ov::as_type_ptr<ov::op::v0::Parameter>(cvt->get_input_node_shared_ptr(0)))
                     continue;
             }
+            ov::NodeVector chain;
+            if (num_inputs >= 3 && match_block_dequant_chain(inp, chain))
+                continue;
             return false;
         }
         return true;
@@ -256,6 +296,16 @@ SDPADecomposed::SDPADecomposed(const std::shared_ptr<ov::npuw::online::Snapshot>
                     if (auto convert_node = std::dynamic_pointer_cast<ov::op::v0::Convert>(input_node)) {
                         if (node_to_gptr->count(convert_node)) {
                             node_to_gptr->at(convert_node)->isolate(isol_tag);
+                        }
+                    }
+                    // Per-block dequantization chain of a compressed block KV cache: the whole
+                    // chain (including the zero-point Convert) stays in the attention group.
+                    ov::NodeVector chain;
+                    if (match_block_dequant_chain(input_node, chain)) {
+                        for (const auto& chain_node : chain) {
+                            if (node_to_gptr->count(chain_node)) {
+                                node_to_gptr->at(chain_node)->isolate(isol_tag);
+                            }
                         }
                     }
                 }

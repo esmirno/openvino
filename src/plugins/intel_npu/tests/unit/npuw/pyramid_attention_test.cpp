@@ -772,7 +772,8 @@ TEST(PyramidAttentionTest, ProcessPyramidModelI8IncludesDQParamsInAttentionInput
 
         ASSERT_TRUE(result.has_value());
         const auto& inputs = result->attention._inputs;
-        EXPECT_EQ(inputs.size(), 2u + compression_case.expected_key_dq_params + compression_case.expected_value_dq_params);
+        EXPECT_EQ(inputs.size(),
+                  2u + compression_case.expected_key_dq_params + compression_case.expected_value_dq_params);
 
         size_t key_params = 0;
         size_t value_params = 0;
@@ -1139,6 +1140,98 @@ TEST(PyramidAttentionTest, ProcessBlockModePyramidModelsProducesGrowingContextLe
 //   attach models, then call validate_port_indices() <- same call added to attn_subgraph.cpp
 
 namespace {
+
+// --- Compressed (i8) block KV cache: per-block scale / zero-point parameters ---
+
+namespace {
+
+std::shared_ptr<ov::Model> make_i8_block_model(size_t block_size, size_t query_len, size_t past_len) {
+    AttentionModelConfig cfg;
+    cfg.query_len = query_len;
+    cfg.past_len = past_len;
+    auto model = build_isolated_attention_model(cfg);
+    ov::npuw::ConvertKVCacheToPrecision(ov::element::i8).run_on_model(model);
+    return apply_split_kvcache_into_blocks(model, static_cast<uint32_t>(block_size));
+}
+
+size_t count_aux_blocks(const std::shared_ptr<ov::Model>& model, size_t lo, size_t hi) {
+    size_t n = 0;
+    for (const auto& p : model->get_parameters()) {
+        const auto dq = ov::npuw::util::parseDQBlockParam(p->get_friendly_name());
+        if (dq && !dq->is_tail && dq->block_idx >= lo && dq->block_idx < hi) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+}  // namespace
+
+TEST(PyramidAttentionTest, BlockModeI8ModelSplitsAuxParametersAndValidates) {
+    auto block_model = make_i8_block_model(32, 32, 96);
+    ASSERT_GT(count_aux_blocks(block_model, 0, 3), 0u) << "the i8 model must carry per-block scale / zero points";
+
+    auto validation = ov::npuw::function::validate_and_setup_pyramid_attention(block_model);
+    ASSERT_TRUE(validation.has_value());
+    const auto& block_result = get_block_result(*validation);
+    EXPECT_EQ(block_result.past_key_block_global_param_indices.size(), 3u);
+    EXPECT_EQ(block_result.past_value_block_global_param_indices.size(), 3u);
+    EXPECT_EQ(block_result.past_kv_length, 96u);
+}
+
+TEST(PyramidAttentionTest, BlockModeI8ShrinkKeepsOnlyTheRetainedBlocksAuxParameters) {
+    auto block_model = make_i8_block_model(32, 32, 96);
+    const size_t aux_total = count_aux_blocks(block_model, 0, 3);
+    ASSERT_GT(aux_total, 0u);
+    const size_t aux_per_block = aux_total / 3u;
+
+    auto validation = ov::npuw::function::validate_and_setup_pyramid_attention(block_model);
+    ASSERT_TRUE(validation.has_value());
+    const auto& block_result = get_block_result(*validation);
+
+    for (size_t idx = 0; idx <= 3; ++idx) {
+        auto result = ov::npuw::function::process_pyramid_model(block_model,
+                                                                idx,
+                                                                32,
+                                                                block_result.query_length,
+                                                                96,
+                                                                block_result.full_context_length,
+                                                                {},
+                                                                {},
+                                                                true);
+        ASSERT_TRUE(result.has_value()) << "model[" << idx << "]";
+        // model[idx] attends over exactly `idx` past blocks: their scales / zero points stay,
+        // those of every dropped block go away together with the data block.
+        EXPECT_EQ(count_aux_blocks(result->model, 0, idx), aux_per_block * idx) << "model[" << idx << "]";
+        EXPECT_EQ(count_aux_blocks(result->model, idx, 3), 0u) << "model[" << idx << "]";
+        // Every retained parameter must be reachable through the global->local map.
+        EXPECT_EQ(result->attention.global_to_local_param_idx.size(), result->model->get_parameters().size())
+            << "model[" << idx << "]";
+    }
+}
+
+TEST(PyramidAttentionTest, BlockModeI8FromRecordsAuxBlockGlobalIndices) {
+    auto block_model = make_i8_block_model(32, 32, 96);
+    const size_t aux_total = count_aux_blocks(block_model, 0, 3);
+    ASSERT_GT(aux_total, 0u);
+
+    auto pyramid = ov::npuw::function::PyramidAttention::from(block_model);
+    ASSERT_TRUE(pyramid.has_value());
+    EXPECT_EQ(pyramid->past_aux_block_global_param_indices.size(), aux_total);
+    for (const auto idx : pyramid->past_aux_block_global_param_indices) {
+        ASSERT_LT(idx, block_model->get_parameters().size());
+        EXPECT_TRUE(ov::npuw::util::isDQScaleOrZPBlockParam(block_model->get_parameters()[idx]->get_friendly_name()));
+    }
+
+    auto compiled = ov::npuw::compiled::PyramidAttention::make(*pyramid);
+    ASSERT_NE(compiled, nullptr);
+    for (const auto idx : pyramid->past_aux_block_global_param_indices) {
+        EXPECT_TRUE(compiled->is_aux_block_global_idx(idx));
+        EXPECT_FALSE(compiled->is_key_block_global_idx(idx));
+        EXPECT_FALSE(compiled->is_value_block_global_idx(idx));
+    }
+    EXPECT_FALSE(compiled->is_aux_block_global_idx(pyramid->global_mask_idx));
+}
 
 // Minimal IPlugin stub needed to construct an ICompiledModel.
 class NullPluginStub final : public ov::IPlugin {

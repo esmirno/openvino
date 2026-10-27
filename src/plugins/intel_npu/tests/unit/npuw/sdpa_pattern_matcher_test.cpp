@@ -8,9 +8,10 @@
 #include <memory>
 #include <string>
 
+#include "common_test_utils/node_builders/constant.hpp"
 #include "intel_npu/config/config.hpp"
 #include "intel_npu/config/npuw.hpp"
-#include "common_test_utils/node_builders/constant.hpp"
+#include "npuw_transformations/split_kvcache_into_blocks.hpp"
 #include "openvino/op/ops.hpp"
 #include "partitioning/online/compiler.hpp"
 #include "partitioning/patterns/sdpa.hpp"
@@ -34,8 +35,9 @@ size_t count_groups_with_tag(const ov::npuw::Ensemble& ens, const std::string& t
 
 // Build a minimal model with decomposed SDPA pattern (no ScaledDotProductAttention op).
 // Graph structure per layer:
-//   past_key(f16) → Convert(f32) → Concat(new_key) → [opt:Unsqueeze→Broadcast→Reshape] → MatMul(query) → Add(mask) → Softmax → MatMul(value_concat) → Transpose → Reshape → Result
-//   past_value(f16) → Convert(f32) → Concat(new_value) → [opt:Unsqueeze→Broadcast→Reshape] →                                                          ↑
+//   past_key(f16) → Convert(f32) → Concat(new_key) → [opt:Unsqueeze→Broadcast→Reshape] → MatMul(query) → Add(mask) →
+//   Softmax → MatMul(value_concat) → Transpose → Reshape → Result past_value(f16) → Convert(f32) → Concat(new_value) →
+//   [opt:Unsqueeze→Broadcast→Reshape] →                                                          ↑
 //
 // Parameters:
 //   num_layers: number of repeated attention layers
@@ -86,15 +88,16 @@ std::shared_ptr<ov::Model> build_decomposed_sdpa_model(size_t num_layers = 1,
         if (with_gqa && num_kv_heads < num_heads) {
             const size_t groups = num_heads / num_kv_heads;
             auto expand_gqa = [&](Output<Node> input, const std::string& kv) -> Output<Node> {
-                auto unsq = std::make_shared<op::v0::Unsqueeze>(
-                    input,
-                    op::v0::Constant::create(element::i64, Shape{1}, {2}));
+                auto unsq =
+                    std::make_shared<op::v0::Unsqueeze>(input, op::v0::Constant::create(element::i64, Shape{1}, {2}));
                 unsq->set_friendly_name("unsqueeze_" + kv + "." + idx);
 
                 auto bcast = std::make_shared<op::v3::Broadcast>(
                     unsq,
-                    op::v0::Constant::create(element::i64, Shape{5},
-                                             std::vector<int64_t>{1, static_cast<int64_t>(num_kv_heads),
+                    op::v0::Constant::create(element::i64,
+                                             Shape{5},
+                                             std::vector<int64_t>{1,
+                                                                  static_cast<int64_t>(num_kv_heads),
                                                                   static_cast<int64_t>(groups),
                                                                   static_cast<int64_t>(context_len),
                                                                   static_cast<int64_t>(head_dim)}));
@@ -102,8 +105,10 @@ std::shared_ptr<ov::Model> build_decomposed_sdpa_model(size_t num_layers = 1,
 
                 auto rshp = std::make_shared<op::v1::Reshape>(
                     bcast,
-                    op::v0::Constant::create(element::i64, Shape{4},
-                                             std::vector<int64_t>{1, static_cast<int64_t>(num_heads),
+                    op::v0::Constant::create(element::i64,
+                                             Shape{4},
+                                             std::vector<int64_t>{1,
+                                                                  static_cast<int64_t>(num_heads),
                                                                   static_cast<int64_t>(context_len),
                                                                   static_cast<int64_t>(head_dim)}),
                     false);
@@ -128,14 +133,16 @@ std::shared_ptr<ov::Model> build_decomposed_sdpa_model(size_t num_layers = 1,
         sv->set_friendly_name("matmul_sv." + idx);
 
         auto transpose = std::make_shared<op::v1::Transpose>(
-            sv, op::v0::Constant::create(element::i64, Shape{4}, std::vector<int64_t>{0, 2, 1, 3}));
+            sv,
+            op::v0::Constant::create(element::i64, Shape{4}, std::vector<int64_t>{0, 2, 1, 3}));
         transpose->set_friendly_name("transpose." + idx);
 
         auto reshape = std::make_shared<op::v1::Reshape>(
             transpose,
-            op::v0::Constant::create(element::i64, Shape{3},
-                                     std::vector<int64_t>{1, static_cast<int64_t>(query_len),
-                                                          static_cast<int64_t>(num_heads * head_dim)}),
+            op::v0::Constant::create(
+                element::i64,
+                Shape{3},
+                std::vector<int64_t>{1, static_cast<int64_t>(query_len), static_cast<int64_t>(num_heads * head_dim)}),
             false);
         reshape->set_friendly_name("reshape." + idx);
 
@@ -187,13 +194,17 @@ std::shared_ptr<ov::Model> build_decomposed_sdpa_dq_model(size_t num_layers = 1,
         auto mask = ov::test::utils::make_param(element::f32, mask_shape, "mask." + idx);
 
         // DQ scale and zp parameters
-        auto key_scale = ov::test::utils::make_param(element::f32, key_scale_shape,
-                                                       "DynamicQuantize/" + idx + "/past_key_values/key/scale");
-        auto key_zp =
-            ov::test::utils::make_param(element::i8, key_scale_shape, "DynamicQuantize/" + idx + "/past_key_values/key/zp");
-        auto value_scale = ov::test::utils::make_param(element::f32, value_scale_shape,
-                                                         "DynamicQuantize/" + idx + "/past_key_values/value/scale");
-        params.insert(params.end(), {query, past_key, past_value, new_key, new_value, mask, key_scale, key_zp, value_scale});
+        auto key_scale = ov::test::utils::make_param(element::f32,
+                                                     key_scale_shape,
+                                                     "DynamicQuantize/" + idx + "/past_key_values/key/scale");
+        auto key_zp = ov::test::utils::make_param(element::i8,
+                                                  key_scale_shape,
+                                                  "DynamicQuantize/" + idx + "/past_key_values/key/zp");
+        auto value_scale = ov::test::utils::make_param(element::f32,
+                                                       value_scale_shape,
+                                                       "DynamicQuantize/" + idx + "/past_key_values/value/scale");
+        params.insert(params.end(),
+                      {query, past_key, past_value, new_key, new_value, mask, key_scale, key_zp, value_scale});
 
         // Past key path: Convert(i8→f32) → Subtract(Convert(zp)) → Multiply(scale) → Concat
         auto cvt_key = std::make_shared<op::v0::Convert>(past_key, element::f32);
@@ -235,14 +246,16 @@ std::shared_ptr<ov::Model> build_decomposed_sdpa_dq_model(size_t num_layers = 1,
         sv->set_friendly_name("matmul_sv." + idx);
 
         auto transpose = std::make_shared<op::v1::Transpose>(
-            sv, op::v0::Constant::create(element::i64, Shape{4}, std::vector<int64_t>{0, 2, 1, 3}));
+            sv,
+            op::v0::Constant::create(element::i64, Shape{4}, std::vector<int64_t>{0, 2, 1, 3}));
         transpose->set_friendly_name("transpose." + idx);
 
         auto reshape = std::make_shared<op::v1::Reshape>(
             transpose,
-            op::v0::Constant::create(element::i64, Shape{3},
-                                     std::vector<int64_t>{1, static_cast<int64_t>(query_len),
-                                                          static_cast<int64_t>(num_heads * head_dim)}),
+            op::v0::Constant::create(
+                element::i64,
+                Shape{3},
+                std::vector<int64_t>{1, static_cast<int64_t>(query_len), static_cast<int64_t>(num_heads * head_dim)}),
             false);
         reshape->set_friendly_name("reshape." + idx);
 
@@ -320,8 +333,40 @@ TEST(SDPAPatternMatcherTest, SDPACompressedDoesNotMatchNonDQModel) {
     auto cfg = make_cfg({{"NPUW_ONLINE_PIPELINE", "REP"}, {"NPUW_ONLINE_ISOLATE", "P:SDPACompressed/attn"}});
     auto ens = ov::npuw::online::buildPartitioning(model, cfg);
 
-    EXPECT_EQ(count_groups_with_tag(ens, "attn"), 0u)
-        << "SDPACompressed should NOT match non-DQ model";
+    EXPECT_EQ(count_groups_with_tag(ens, "attn"), 0u) << "SDPACompressed should NOT match non-DQ model";
+}
+
+// A compressed block KV cache (SplitKVCacheIntoBlocks over a DQ model) concatenates one dequantization
+// chain per past block; SDPADecomposed isolates the whole attention including those chains.
+TEST(SDPAPatternMatcherTest, SDPADecomposedMatchesBlockSplitDQModel) {
+    auto model = build_decomposed_sdpa_dq_model(/*num_layers=*/2,
+                                                /*num_heads=*/4,
+                                                /*head_dim=*/16,
+                                                /*query_len=*/8,
+                                                /*past_len=*/24);
+    ov::npuw::pass::SplitKVCacheIntoBlocks(/*block_size=*/8, /*v_transposed=*/false).run_on_model(model);
+    model->validate_nodes_and_infer_types();
+
+    auto cfg = make_cfg({{"NPUW_ONLINE_PIPELINE", "REP"}, {"NPUW_ONLINE_ISOLATE", "P:SDPADecomposed/attn"}});
+    auto ens = ov::npuw::online::buildPartitioning(model, cfg);
+
+    EXPECT_GE(count_groups_with_tag(ens, "attn"), 2u)
+        << "SDPADecomposed should match the block-split compressed attention of both layers";
+}
+
+TEST(SDPAPatternMatcherTest, ATTNPresetMatchesBlockSplitDQModel) {
+    auto model = build_decomposed_sdpa_dq_model(/*num_layers=*/2,
+                                                /*num_heads=*/4,
+                                                /*head_dim=*/16,
+                                                /*query_len=*/8,
+                                                /*past_len=*/24);
+    ov::npuw::pass::SplitKVCacheIntoBlocks(/*block_size=*/8, /*v_transposed=*/false).run_on_model(model);
+    model->validate_nodes_and_infer_types();
+
+    auto cfg = make_cfg({{"NPUW_ONLINE_PIPELINE", "REP"}, {"NPUW_ONLINE_ISOLATE", "ATTN"}});
+    auto ens = ov::npuw::online::buildPartitioning(model, cfg);
+
+    EXPECT_GE(count_groups_with_tag(ens, "attn"), 2u);
 }
 
 // --- ATTN preset test (boxed: runs all SDPA matchers via the ATTN preset) ---

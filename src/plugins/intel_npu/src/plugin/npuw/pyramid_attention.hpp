@@ -115,6 +115,11 @@ struct PyramidAttention {
     std::vector<size_t> past_key_block_global_param_indices;
     std::vector<size_t> past_value_block_global_param_indices;
 
+    // Block mode of a compressed KV cache only: global indices of the per-block quantization
+    // parameters (scale / zero point) in the full model. A variant that drops a KV block drops
+    // these with it, so the runtime needs them to tell "dropped" from "unknown input".
+    std::vector<size_t> past_aux_block_global_param_indices;
+
     // Global (original/full model) parameter index of the attention mask. Same across all
     // pyramid variants (the mask parameter is never dropped, only reshaped). Populated by
     // from() in both contiguous and block modes.
@@ -257,6 +262,9 @@ struct PyramidAttention {
     // at all" (both would return false/miss). Contiguous subclass always returns false.
     virtual bool is_key_block_global_idx(size_t idx) const = 0;
     virtual bool is_value_block_global_idx(size_t idx) const = 0;
+    // True if 'idx' is a per-block quantization parameter (scale / zero point) of a compressed
+    // block KV cache in the full model. Contiguous subclass always returns false.
+    virtual bool is_aux_block_global_idx(size_t idx) const = 0;
 
     // Contiguous-mode KV param lookup
     // Returns the sequence dimension for input_idx in pyramid variant pyramid_id,
@@ -326,6 +334,9 @@ struct PyramidAttentionContiguous final : PyramidAttention {
     bool is_value_block_global_idx(size_t) const override {
         return false;
     }
+    bool is_aux_block_global_idx(size_t) const override {
+        return false;
+    }
     std::optional<std::size_t> kv_param_dim(size_t pyramid_id, size_t input_idx) const override;
     const std::unordered_map<size_t, size_t>& param_port_map_at(size_t) const override;
     void collect_strided_input_names(const ov::Model& model, std::string& out) const override;
@@ -341,6 +352,9 @@ struct PyramidAttentionBlock final : PyramidAttention {
     /// O(1) membership views over the vectors above, for is_key/value_block_global_idx().
     std::unordered_set<size_t> _key_block_global_set;
     std::unordered_set<size_t> _value_block_global_set;
+    /// Global indices of the per-block quantization parameters of a compressed KV cache.
+    std::vector<size_t> past_aux_block_global_param_indices;
+    std::unordered_set<size_t> _aux_block_global_set;
 
     bool is_block_mode() const override {
         return true;
@@ -371,6 +385,9 @@ struct PyramidAttentionBlock final : PyramidAttention {
     }
     bool is_value_block_global_idx(size_t idx) const override {
         return _value_block_global_set.count(idx) != 0;
+    }
+    bool is_aux_block_global_idx(size_t idx) const override {
+        return _aux_block_global_set.count(idx) != 0;
     }
     std::optional<std::size_t> kv_param_dim(size_t, size_t) const override {
         return std::nullopt;

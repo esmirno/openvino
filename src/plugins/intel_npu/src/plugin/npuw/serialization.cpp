@@ -88,8 +88,8 @@ void ov::npuw::orc::serialize(Stream& stream, ov::npuw::compiled::PyramidAttenti
 
 void ov::npuw::orc::serialize(Stream& stream, ov::npuw::compiled::PyramidAttentionBlock& var) {
     stream & var.original_query_length & var.full_context_size & var._context_lengths & var._attention_infos &
-        var.past_key_block_global_param_indices & var.past_value_block_global_param_indices & var.global_mask_idx &
-        var._data_left_aligned;
+        var.past_key_block_global_param_indices & var.past_value_block_global_param_indices &
+        var.past_aux_block_global_param_indices & var.global_mask_idx & var._data_left_aligned;
 }
 
 void ov::npuw::orc::serialize(Stream& stream, ov::npuw::compiled::PyramidAttention& var) {
@@ -117,6 +117,8 @@ std::shared_ptr<ov::npuw::compiled::PyramidAttention> ov::npuw::orc::make_pyrami
                                                                 obj->past_key_block_global_param_indices.end());
         obj->_value_block_global_set = std::unordered_set<size_t>(obj->past_value_block_global_param_indices.begin(),
                                                                   obj->past_value_block_global_param_indices.end());
+        obj->_aux_block_global_set = std::unordered_set<size_t>(obj->past_aux_block_global_param_indices.begin(),
+                                                                obj->past_aux_block_global_param_indices.end());
         return obj;
     }
 }
