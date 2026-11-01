@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <optional>
+
 #include "openvino/op/op.hpp"
 
 namespace ov::intel_npu::op {
@@ -16,6 +18,19 @@ public:
     struct Config {
         bool is_head = false;
         bool is_tail = false;
+        bool has_attention_mask = false;
+        bool has_key_scale = false;
+        bool has_key_zero_point = false;
+        bool has_value_scale = false;
+        bool has_value_zero_point = false;
+    };
+
+    struct OptionalInputs {
+        std::optional<Output<Node>> attention_mask;
+        std::optional<Output<Node>> key_scale;
+        std::optional<Output<Node>> key_zero_point;
+        std::optional<Output<Node>> value_scale;
+        std::optional<Output<Node>> value_zero_point;
     };
 
     FlashAttentionTile() = default;
@@ -28,25 +43,7 @@ public:
                        const Output<Node>& running_output,
                        const Output<Node>& running_max,
                        const Output<Node>& running_sum,
-                       const Output<Node>& attn_mask,
-                       const Output<Node>& scale,
-                       Config config);
-
-    FlashAttentionTile(const Output<Node>& query,
-                       const Output<Node>& key,
-                       const Output<Node>& value,
-                       const Output<Node>& running_output,
-                       const Output<Node>& running_max,
-                       const Output<Node>& running_sum,
-                       const Output<Node>& attn_mask,
-                       Config config);
-
-    FlashAttentionTile(const Output<Node>& query,
-                       const Output<Node>& key,
-                       const Output<Node>& value,
-                       const Output<Node>& running_output,
-                       const Output<Node>& running_max,
-                       const Output<Node>& running_sum,
+                       OptionalInputs optional_inputs,
                        Config config);
 
     std::shared_ptr<Node> clone_with_new_inputs(const OutputVector& new_args) const override;

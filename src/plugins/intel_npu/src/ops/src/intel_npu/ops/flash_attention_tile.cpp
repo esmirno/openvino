@@ -3,6 +3,7 @@
 //
 
 #include <algorithm>
+#include <cstdint>
 #include <functional>
 #include <intel_npu/ops/flash_attention_tile.hpp>
 #include <limits>
@@ -17,6 +18,83 @@
 using namespace std;
 
 namespace {
+
+struct FlashAttentionInputLayout {
+    bool has_attention_mask = false;
+    bool has_key_scale = false;
+    bool has_key_zero_point = false;
+    bool has_value_scale = false;
+    bool has_value_zero_point = false;
+    size_t key_scale = 0;
+    size_t key_zero_point = 0;
+    size_t value_scale = 0;
+    size_t value_zero_point = 0;
+};
+
+static FlashAttentionInputLayout get_input_layout(const ov::intel_npu::op::FlashAttentionTile* op, size_t input_count) {
+    const auto& config = op->get_config();
+    const auto optional_input_count = static_cast<size_t>(config.has_attention_mask) +
+                                      static_cast<size_t>(config.has_key_scale) +
+                                      static_cast<size_t>(config.has_key_zero_point) +
+                                      static_cast<size_t>(config.has_value_scale) +
+                                      static_cast<size_t>(config.has_value_zero_point);
+    const auto expected_input_count = 6u + optional_input_count;
+
+    NODE_VALIDATION_CHECK(op,
+                          input_count == expected_input_count,
+                          "Expected ",
+                          expected_input_count,
+                          " inputs for the configured optional inputs, got ",
+                          input_count,
+                          ".");
+
+    FlashAttentionInputLayout layout;
+    layout.has_attention_mask = config.has_attention_mask;
+    layout.has_key_scale = config.has_key_scale;
+    layout.has_key_zero_point = config.has_key_zero_point;
+    layout.has_value_scale = config.has_value_scale;
+    layout.has_value_zero_point = config.has_value_zero_point;
+
+    auto next_input = 6u;
+    if (layout.has_attention_mask) {
+        ++next_input;
+    }
+    if (layout.has_key_scale) {
+        layout.key_scale = next_input++;
+    }
+    if (layout.has_key_zero_point) {
+        layout.key_zero_point = next_input++;
+    }
+    if (layout.has_value_scale) {
+        layout.value_scale = next_input++;
+    }
+    if (layout.has_value_zero_point) {
+        layout.value_zero_point = next_input++;
+    }
+    return layout;
+}
+
+static bool is_compressed_kv_type(const ov::element::Type& type) {
+    return type == ov::element::i8 || type == ov::element::u8;
+}
+
+static bool is_supported_reference_scale_type(const ov::element::Type& type) {
+    return type == ov::element::f16 || type == ov::element::f32;
+}
+
+static bool is_broadcastable_to(const ov::Shape& source, const ov::Shape& target) {
+    if (source.size() > target.size()) {
+        return false;
+    }
+
+    const auto offset = target.size() - source.size();
+    for (size_t i = 0; i < source.size(); ++i) {
+        if (source[i] != 1 && source[i] != target[offset + i]) {
+            return false;
+        }
+    }
+    return true;
+}
 
 void flash_attention_evaluate(const float* query,
                               const float* key,
@@ -135,9 +213,9 @@ using namespace ov::op;
 static std::vector<ov::PartialShape> shape_infer(const FlashAttentionTile* op,
                                                  const std::vector<ov::PartialShape>& input_shapes) {
     using DimType = typename ov::PartialShape::value_type;
-    const auto& inputs_count = input_shapes.size();
-    const auto& has_attention_mask = (inputs_count >= 7) && (input_shapes[6].size() > 1);
-    NODE_VALIDATION_CHECK(op, inputs_count == 6 || has_attention_mask);
+    const auto inputs_count = input_shapes.size();
+    const auto input_layout = get_input_layout(op, inputs_count);
+    const auto has_attention_mask = input_layout.has_attention_mask;
 
     DimType e_dim{};
     DimType l_dim{};
@@ -298,6 +376,43 @@ static std::vector<ov::PartialShape> shape_infer(const FlashAttentionTile* op,
     return {result_running_output_shape, result_running_max_and_sum_shape, result_running_max_and_sum_shape};
 }
 
+static ov::OutputVector make_inputs(const ov::Output<ov::Node>& query,
+                                    const ov::Output<ov::Node>& key,
+                                    const ov::Output<ov::Node>& value,
+                                    const ov::Output<ov::Node>& running_output,
+                                    const ov::Output<ov::Node>& running_max,
+                                    const ov::Output<ov::Node>& running_sum,
+                                    const ov::intel_npu::op::FlashAttentionTile::OptionalInputs& optional_inputs) {
+    ov::OutputVector inputs{query, key, value, running_output, running_max, running_sum};
+    if (optional_inputs.attention_mask) {
+        inputs.push_back(*optional_inputs.attention_mask);
+    }
+    if (optional_inputs.key_scale) {
+        inputs.push_back(*optional_inputs.key_scale);
+    }
+    if (optional_inputs.key_zero_point) {
+        inputs.push_back(*optional_inputs.key_zero_point);
+    }
+    if (optional_inputs.value_scale) {
+        inputs.push_back(*optional_inputs.value_scale);
+    }
+    if (optional_inputs.value_zero_point) {
+        inputs.push_back(*optional_inputs.value_zero_point);
+    }
+    return inputs;
+}
+
+static ov::intel_npu::op::FlashAttentionTile::Config config_with_optional_inputs(
+    ov::intel_npu::op::FlashAttentionTile::Config config,
+    const ov::intel_npu::op::FlashAttentionTile::OptionalInputs& optional_inputs) {
+    config.has_attention_mask = optional_inputs.attention_mask.has_value();
+    config.has_key_scale = optional_inputs.key_scale.has_value();
+    config.has_key_zero_point = optional_inputs.key_zero_point.has_value();
+    config.has_value_scale = optional_inputs.value_scale.has_value();
+    config.has_value_zero_point = optional_inputs.value_zero_point.has_value();
+    return config;
+}
+
 FlashAttentionTile::FlashAttentionTile(const OutputVector& inputs, Config config)
     : op::Op(inputs),
       m_config(std::move(config)) {
@@ -310,26 +425,26 @@ FlashAttentionTile::FlashAttentionTile(const Output<Node>& query,
                                        const Output<Node>& running_output,
                                        const Output<Node>& running_max,
                                        const Output<Node>& running_sum,
+                                       OptionalInputs optional_inputs,
                                        Config config)
-    : FlashAttentionTile({query, key, value, running_output, running_max, running_sum}, std::move(config)) {}
-
-FlashAttentionTile::FlashAttentionTile(const Output<Node>& query,
-                                       const Output<Node>& key,
-                                       const Output<Node>& value,
-                                       const Output<Node>& running_output,
-                                       const Output<Node>& running_max,
-                                       const Output<Node>& running_sum,
-                                       const Output<Node>& attn_mask,
-                                       Config config)
-    : FlashAttentionTile({query, key, value, running_output, running_max, running_sum, attn_mask}, std::move(config)) {}
+    : FlashAttentionTile(make_inputs(query, key, value, running_output, running_max, running_sum, optional_inputs),
+                         config_with_optional_inputs(std::move(config), optional_inputs)) {}
 
 void FlashAttentionTile::validate_and_infer_types() {
+    const auto input_layout = get_input_layout(this, get_input_size());
     const auto attention_mask_idx = 6;
 
     auto query_element_type = get_input_element_type(0);
     const auto input_size = static_cast<int32_t>(get_input_size());
 
-    if (input_size >= 7) {
+    NODE_VALIDATION_CHECK(this,
+                          !input_layout.has_key_zero_point || input_layout.has_key_scale,
+                          "Key zero-point input requires a key scale input.");
+    NODE_VALIDATION_CHECK(this,
+                          !input_layout.has_value_zero_point || input_layout.has_value_scale,
+                          "Value zero-point input requires a value scale input.");
+
+    if (input_layout.has_attention_mask) {
         const auto& attention_type = get_input_element_type(attention_mask_idx);
         NODE_VALIDATION_CHECK(
             this,
@@ -337,12 +452,38 @@ void FlashAttentionTile::validate_and_infer_types() {
             "The element type of attention_mask must be either floating-point or boolean.");
     }
 
-    // Support only f32 reference
     for (int32_t i = 1; i < input_size; i++) {
         const auto& element_type = get_input_element_type(i);
 
-        if (i == attention_mask_idx && (element_type == element::boolean)) {
-            // Skip checking attention_mask in loop when boolean or skipped to not affect merged dtype.
+        if (input_layout.has_attention_mask && i == attention_mask_idx) {
+            continue;
+        }
+
+        const bool is_key = i == 1;
+        const bool is_value = i == 2;
+        if ((is_key && input_layout.has_key_scale) || (is_value && input_layout.has_value_scale)) {
+            NODE_VALIDATION_CHECK(this,
+                                  is_compressed_kv_type(element_type) || element_type.is_dynamic(),
+                                  "Compressed key and value inputs must use i8 or u8 element types.");
+            continue;
+        }
+
+        const bool is_scale = (input_layout.has_key_scale && i == static_cast<int32_t>(input_layout.key_scale)) ||
+                              (input_layout.has_value_scale && i == static_cast<int32_t>(input_layout.value_scale));
+        if (is_scale) {
+            NODE_VALIDATION_CHECK(this,
+                                  is_supported_reference_scale_type(element_type) || element_type.is_dynamic(),
+                                  "Compressed KV scale inputs must use f16 or f32 element types.");
+            continue;
+        }
+
+        const bool is_zero_point =
+            (input_layout.has_key_zero_point && i == static_cast<int32_t>(input_layout.key_zero_point)) ||
+            (input_layout.has_value_zero_point && i == static_cast<int32_t>(input_layout.value_zero_point));
+        if (is_zero_point) {
+            NODE_VALIDATION_CHECK(this,
+                                  is_compressed_kv_type(element_type) || element_type.is_dynamic(),
+                                  "Compressed KV zero-point inputs must use i8 or u8 element types.");
             continue;
         }
 
@@ -353,7 +494,43 @@ void FlashAttentionTile::validate_and_infer_types() {
 
     NODE_VALIDATION_CHECK(this,
                           query_element_type.is_real() || query_element_type.is_dynamic(),
-                          "The element type of the input tensor must be a floating-point.");
+                          "The element type of the query input tensor must be floating-point.");
+
+    const auto& key_shape = get_input_partial_shape(1);
+    const auto& value_shape = get_input_partial_shape(2);
+    if (input_layout.has_key_scale) {
+        NODE_VALIDATION_CHECK(this,
+                              key_shape.is_dynamic() || get_input_partial_shape(input_layout.key_scale).is_dynamic() ||
+                                  !key_shape.is_static() ||
+                                  is_broadcastable_to(get_input_partial_shape(input_layout.key_scale).to_shape(),
+                                                      key_shape.to_shape()),
+                              "Key scale shape is not broadcastable to the compressed key shape.");
+    }
+    if (input_layout.has_value_scale) {
+        NODE_VALIDATION_CHECK(this,
+                              value_shape.is_dynamic() || get_input_partial_shape(input_layout.value_scale).is_dynamic() ||
+                                  !value_shape.is_static() ||
+                                  is_broadcastable_to(get_input_partial_shape(input_layout.value_scale).to_shape(),
+                                                      value_shape.to_shape()),
+                              "Value scale shape is not broadcastable to the compressed value shape.");
+    }
+    if (input_layout.has_key_zero_point) {
+        NODE_VALIDATION_CHECK(
+            this,
+            key_shape.is_dynamic() || get_input_partial_shape(input_layout.key_zero_point).is_dynamic() ||
+                !key_shape.is_static() ||
+                is_broadcastable_to(get_input_partial_shape(input_layout.key_zero_point).to_shape(), key_shape.to_shape()),
+            "Key zero-point shape is not broadcastable to the compressed key shape.");
+    }
+    if (input_layout.has_value_zero_point) {
+        NODE_VALIDATION_CHECK(this,
+                              value_shape.is_dynamic() ||
+                                  get_input_partial_shape(input_layout.value_zero_point).is_dynamic() ||
+                                  !value_shape.is_static() ||
+                                  is_broadcastable_to(get_input_partial_shape(input_layout.value_zero_point).to_shape(),
+                                                      value_shape.to_shape()),
+                              "Value zero-point shape is not broadcastable to the compressed value shape.");
+    }
 
     const auto& input_shapes = ov::util::get_node_input_partial_shapes(*this);
     const auto output_shapes = shape_infer(this, input_shapes);
@@ -374,6 +551,11 @@ std::shared_ptr<Node> FlashAttentionTile::clone_with_new_inputs(const OutputVect
 bool FlashAttentionTile::visit_attributes(AttributeVisitor& visitor) {
     visitor.on_attribute("is_head", m_config.is_head);
     visitor.on_attribute("is_tail", m_config.is_tail);
+    visitor.on_attribute("has_attention_mask", m_config.has_attention_mask);
+    visitor.on_attribute("has_key_scale", m_config.has_key_scale);
+    visitor.on_attribute("has_key_zero_point", m_config.has_key_zero_point);
+    visitor.on_attribute("has_value_scale", m_config.has_value_scale);
+    visitor.on_attribute("has_value_zero_point", m_config.has_value_zero_point);
     return true;
 }
 
@@ -397,10 +579,31 @@ bool FlashAttentionTile::has_evaluate() const {
     switch (get_input_element_type(0)) {
     case element::f16:
     case element::f32:
-        return true;
+        break;
     default:
         return false;
     }
+
+    if (!m_config.has_key_scale && !m_config.has_value_scale) {
+        return true;
+    }
+
+    const auto input_layout = get_input_layout(this, get_input_size());
+    if ((input_layout.has_key_scale &&
+         (!is_compressed_kv_type(get_input_element_type(KEY)) ||
+          !is_supported_reference_scale_type(get_input_element_type(input_layout.key_scale)))) ||
+        (input_layout.has_value_scale &&
+         (!is_compressed_kv_type(get_input_element_type(VALUE)) ||
+          !is_supported_reference_scale_type(get_input_element_type(input_layout.value_scale))))) {
+        return false;
+    }
+    if ((input_layout.has_key_zero_point &&
+         !is_compressed_kv_type(get_input_element_type(input_layout.key_zero_point))) ||
+        (input_layout.has_value_zero_point &&
+         !is_compressed_kv_type(get_input_element_type(input_layout.value_zero_point)))) {
+        return false;
+    }
+    return true;
 };
 
 template <typename T>
@@ -437,8 +640,84 @@ static ov::Tensor to_f32(const ov::Tensor& tensor) {
     return result;
 }
 
+static float tensor_value_as_float(const ov::Tensor& tensor, size_t index) {
+    switch (tensor.get_element_type()) {
+    case ov::element::f16:
+        return static_cast<float>(tensor.data<const ov::float16>()[index]);
+    case ov::element::f32:
+        return tensor.data<const float>()[index];
+    case ov::element::i8:
+        return static_cast<float>(tensor.data<const int8_t>()[index]);
+    case ov::element::u8:
+        return static_cast<float>(tensor.data<const uint8_t>()[index]);
+    default:
+        OPENVINO_THROW("Unsupported element type in compressed KV tensor: ", tensor.get_element_type());
+    }
+}
+
+static size_t broadcasted_index(size_t index, const ov::Shape& target_shape, const ov::Shape& source_shape) {
+    const auto target_rank = target_shape.size();
+    const auto source_rank = source_shape.size();
+    const auto rank_offset = target_rank - source_rank;
+
+    size_t source_index = 0;
+    size_t target_stride = 1;
+    size_t source_stride = 1;
+    for (size_t dim = target_rank; dim-- > 0;) {
+        const auto target_coord = (index / target_stride) % target_shape[dim];
+        if (dim >= rank_offset) {
+            const auto source_dim = dim - rank_offset;
+            const auto source_coord = source_shape[source_dim] == 1 ? 0 : target_coord;
+            source_index += source_coord * source_stride;
+            source_stride *= source_shape[source_dim];
+        }
+        target_stride *= target_shape[dim];
+    }
+    return source_index;
+}
+
+static ov::Tensor dequantize_kv(const ov::Tensor& data,
+                                const ov::Tensor& scale,
+                                const ov::Tensor* zero_point) {
+    OPENVINO_ASSERT(is_compressed_kv_type(data.get_element_type()),
+                    "Compressed KV data must use i8 or u8, got ",
+                    data.get_element_type());
+    OPENVINO_ASSERT(is_supported_reference_scale_type(scale.get_element_type()),
+                    "Compressed KV scale must use f16 or f32, got ",
+                    scale.get_element_type());
+    OPENVINO_ASSERT(is_broadcastable_to(scale.get_shape(), data.get_shape()),
+                    "Compressed KV scale shape ",
+                    scale.get_shape(),
+                    " is not broadcastable to data shape ",
+                    data.get_shape());
+    if (zero_point) {
+        OPENVINO_ASSERT(is_compressed_kv_type(zero_point->get_element_type()),
+                        "Compressed KV zero-point must use i8 or u8, got ",
+                        zero_point->get_element_type());
+        OPENVINO_ASSERT(is_broadcastable_to(zero_point->get_shape(), data.get_shape()),
+                        "Compressed KV zero-point shape ",
+                        zero_point->get_shape(),
+                        " is not broadcastable to data shape ",
+                        data.get_shape());
+    }
+
+    ov::Tensor result(ov::element::f32, data.get_shape());
+    auto* dst = result.data<float>();
+    for (size_t i = 0; i < data.get_size(); ++i) {
+        const auto scale_value = tensor_value_as_float(scale, broadcasted_index(i, data.get_shape(), scale.get_shape()));
+        const auto data_value = tensor_value_as_float(data, i);
+        const auto zero_point_value =
+            zero_point ? tensor_value_as_float(*zero_point,
+                                               broadcasted_index(i, data.get_shape(), zero_point->get_shape()))
+                       : 0.0f;
+        dst[i] = (data_value - zero_point_value) * scale_value;
+    }
+    return result;
+}
+
 static void from_f32(const ov::Tensor& f32_tensor, ov::Tensor& dst_tensor) {
     if (dst_tensor.get_element_type() == ov::element::f32) {
+        std::copy_n(f32_tensor.data<const float>(), f32_tensor.get_size(), dst_tensor.data<float>());
         return;
     }
     if (dst_tensor.get_element_type() != ov::element::f16) {
@@ -538,22 +817,40 @@ static bool evaluate_flash_attention_impl(ov::TensorVector& outputs,
 
 inline bool FlashAttentionTile::evaluate(ov::TensorVector& outputs, const ov::TensorVector& inputs) const {
     auto input_type = get_input_element_type(QUERY);
-    if (input_type == ov::element::f32) {
-        return evaluate_flash_attention_impl(outputs, inputs, m_config);
-    }
-
-    if (input_type != ov::element::f16) {
+    if (input_type != ov::element::f16 && input_type != ov::element::f32) {
         return false;
     }
 
-    // Convert f16 inputs to f32 for computation
-    ov::TensorVector f32_inputs;
-    f32_inputs.reserve(inputs.size());
-    for (size_t i = 0; i < inputs.size(); ++i) {
-        f32_inputs.push_back(to_f32(inputs[i]));
+    const bool has_compressed_kv = m_config.has_key_scale || m_config.has_value_scale;
+    if (input_type == ov::element::f32 && !has_compressed_kv) {
+        return evaluate_flash_attention_impl(outputs, inputs, m_config);
     }
 
-    // Allocate f32 outputs
+    const auto input_layout = get_input_layout(this, inputs.size());
+    ov::TensorVector f32_inputs;
+    f32_inputs.reserve(input_layout.has_attention_mask ? 7 : 6);
+    f32_inputs.push_back(to_f32(inputs[QUERY]));
+    if (input_layout.has_key_scale) {
+        const auto* key_zero_point =
+            input_layout.has_key_zero_point ? &inputs[input_layout.key_zero_point] : nullptr;
+        f32_inputs.push_back(dequantize_kv(inputs[KEY], inputs[input_layout.key_scale], key_zero_point));
+    } else {
+        f32_inputs.push_back(to_f32(inputs[KEY]));
+    }
+    if (input_layout.has_value_scale) {
+        const auto* value_zero_point =
+            input_layout.has_value_zero_point ? &inputs[input_layout.value_zero_point] : nullptr;
+        f32_inputs.push_back(dequantize_kv(inputs[VALUE], inputs[input_layout.value_scale], value_zero_point));
+    } else {
+        f32_inputs.push_back(to_f32(inputs[VALUE]));
+    }
+    for (size_t i = RUNNING_OUTPUT; i <= RUNNING_SUM; ++i) {
+        f32_inputs.push_back(to_f32(inputs[i]));
+    }
+    if (input_layout.has_attention_mask) {
+        f32_inputs.push_back(to_f32(inputs[ATTENTION_MASK]));
+    }
+
     ov::TensorVector f32_outputs;
     f32_outputs.reserve(outputs.size());
     for (size_t i = 0; i < outputs.size(); ++i) {
