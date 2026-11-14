@@ -330,6 +330,19 @@ ov::AnyMap get_default_common_config(const std::optional<NPUDesc>& npudesc) {
     return config;
 }
 
+// Merge parallel MatMuls over both weight layouts (NPUW_PMM=0,2), so the transposed-weight
+// Q/K/V and gate/up projections are fused too. Measured as neutral-to-positive on PTL (NPU5010);
+// on NVL (NPU6010) it regressed 7-8B models, so keep the default ("2") elsewhere.
+bool merge_all_parallel_matmuls(const std::optional<NPUDesc>& npudesc) {
+    if (!npudesc.has_value() || !npudesc->compiler_dq) {
+        return false;
+    }
+    const auto platform = npudesc->arch != ov::intel_npu::Platform::AUTO_DETECT
+                              ? ov::intel_npu::Platform::standardize(npudesc->arch)
+                              : npudesc->arch;
+    return platform == ov::intel_npu::Platform::NPU5010;
+}
+
 ov::AnyMap get_default_prefill_config(const std::shared_ptr<ov::Model>& model, const std::optional<NPUDesc>& npudesc) {
     auto config = get_default_common_config(npudesc);
     // Specify NPUW DQ if Compiler DQ is not enabled
@@ -339,6 +352,9 @@ ov::AnyMap get_default_prefill_config(const std::shared_ptr<ov::Model>& model, c
         } else {
             config.emplace("NPUW_PMM", "NO");
         }
+    }
+    if (merge_all_parallel_matmuls(npudesc)) {
+        config.emplace("NPUW_PMM", "0,2");
     }
     return config;
 }
@@ -355,6 +371,9 @@ ov::AnyMap get_default_generate_config(const std::optional<NPUDesc>& npudesc,
     // Specify NPUW DQ if Compiler DQ is not enabled
     if (!npudesc.has_value() || !npudesc->compiler_dq) {
         config.emplace("NPUW_DQ", "YES");
+    }
+    if (merge_all_parallel_matmuls(npudesc)) {
+        config.emplace("NPUW_PMM", "0,2");
     }
     // We don't need slice out for kv cache model, especially for speculative decoding which need
     // to generate more than 1 token for each inference
