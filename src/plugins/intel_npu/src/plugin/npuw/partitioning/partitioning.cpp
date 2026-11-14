@@ -2184,6 +2184,7 @@ void Partitioner::optimize(const std::string& func_name) {
         ov::npuw::patterns::opt::Context ctx(f._model, f._param_offset);
         ctx.is_spatial = f._spatial.has_value();
         ctx.pmm_dims = cfg.get<::intel_npu::NPUW_PMM>();
+        ctx.pmm_any_act = cfg.get<::intel_npu::NPUW_PMM_ANY_ACT>();
 
         // Run Head/Tail passes
         ov::pass::GraphRewrite rewr;

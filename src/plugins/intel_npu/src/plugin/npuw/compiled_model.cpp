@@ -3158,6 +3158,7 @@ void ov::npuw::CompiledModel::implement_properties() {
                           BIND(npuw::partitioning::dyn_quant, NPUW_DQ),
                           BIND(npuw::partitioning::dyn_quant_full, NPUW_DQ_FULL),
                           BIND(npuw::partitioning::par_matmul_merge_dims, NPUW_PMM),
+                          BIND(npuw::partitioning::par_matmul_merge_any_activation, NPUW_PMM_ANY_ACT),
                           BIND(npuw::partitioning::matmul_gate_preserve_constants, NPUW_MM_GATED),
                           BIND(npuw::partitioning::slice_out, NPUW_SLICE_OUT),
                           BIND(npuw::partitioning::spatial, NPUW_SPATIAL),

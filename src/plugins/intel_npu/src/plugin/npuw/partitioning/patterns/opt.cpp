@@ -1008,6 +1008,8 @@ DQMatMulGQ2iP::DQMatMulGQ2iP(Context::Ref ctx) {
 // Multiply -----------------------------------> MatMul
 // Param(W) -> to(f32) -> Multiply -> Reshape ->
 // Param(S) ------------>
+//
+// With Context::pmm_any_act the shared activation may be any node, not only a Multiply.
 
 DQParMMGQ::DQParMMGQ(Context::Ref ctx) {
     auto qweight = opp::wrap_type<ov::op::v0::Parameter>();
@@ -1015,7 +1017,9 @@ DQParMMGQ::DQParMMGQ(Context::Ref ctx) {
     auto qcvtw = opp::wrap_type<ov::op::v0::Convert>({qweight});
     auto qmuls = opp::wrap_type<ov::op::v1::Multiply>({qcvtw, qcoeff});
     auto qreshp = opp::wrap_type<ov::op::v1::Reshape>({qmuls, opp::any_input()});
-    auto qmmi = opp::wrap_type<ov::op::v1::Multiply>({opp::any_input(), opp::any_input()});
+    std::shared_ptr<ov::Node> qmmi = ctx.get().pmm_any_act
+                                         ? opp::any_input()
+                                         : opp::wrap_type<ov::op::v1::Multiply>({opp::any_input(), opp::any_input()});
     auto qcvtr = opp::optional<ov::op::v0::Convert>({qreshp->output(0)});
     auto qcvtm = opp::optional<ov::op::v0::Convert>({qmmi->output(0)});
     auto qmm = opp::wrap_type<ov::op::v0::MatMul>({qcvtm, qcvtr});
@@ -1076,10 +1080,12 @@ void mergeParallelMatMuls(const std::shared_ptr<ov::Model>& m, Context& ctx) {
 
         const auto& first_w = parallel_matmuls[0].w;
         const auto& first_s = parallel_matmuls[0].s;
+        const auto orig_out_type = parallel_matmuls[0].mm->get_output_element_type(0);
         ov::ParameterVector old_w, old_s;
         bool all_ok = true;
         for (auto&& dqmm : parallel_matmuls) {
-            if (first_w->get_shape().size() != dqmm.w->get_shape().size() ||
+            if (dqmm.mm->get_output_element_type(0) != orig_out_type ||
+                first_w->get_shape().size() != dqmm.w->get_shape().size() ||
                 first_s->get_shape().size() != dqmm.s->get_shape().size() ||
                 dqmm.w->get_shape().size() != dqmm.s->get_shape().size()) {
                 all_ok = false;
@@ -1121,7 +1127,13 @@ void mergeParallelMatMuls(const std::shared_ptr<ov::Model>& m, Context& ctx) {
         auto new_rshp = std::make_shared<ov::op::v1::Reshape>(new_mul, new_rshp_c, false);
 
         // Transpose input_b if concat was done by 0th axis (meaning the original MM's input_b were also transposed)
-        auto new_mm = std::make_shared<ov::op::v0::MatMul>(orig_multiply, new_rshp, false, (axis_to_concat == 0));
+        std::shared_ptr<ov::Node> new_mm =
+            std::make_shared<ov::op::v0::MatMul>(orig_multiply, new_rshp, false, (axis_to_concat == 0));
+        // The activation is taken before the optional Convert of the original MatMuls,
+        // so the merged MatMul may produce another type (f16 instead of f32). Restore it for the readers.
+        if (new_mm->get_output_element_type(0) != orig_out_type) {
+            new_mm = std::make_shared<ov::op::v0::Convert>(new_mm, orig_out_type);
+        }
 
         // Create new slices & reconnect matmuls
         // FIXME: use zip

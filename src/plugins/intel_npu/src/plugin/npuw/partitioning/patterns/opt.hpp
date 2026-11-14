@@ -22,6 +22,9 @@ namespace opt {
 
 struct Context {
     std::string pmm_dims;
+    // Merge parallel MatMuls that share any activation, not only a Multiply (RMSNorm output).
+    // Post-norm models (e.g. EXAONE-4) feed Q/K/V straight from the residual Add.
+    bool pmm_any_act = true;
     bool is_spatial = false;
     bool mm_dq_full = true;
     bool mm_gate = false;
