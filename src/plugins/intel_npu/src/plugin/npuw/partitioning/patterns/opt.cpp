@@ -1127,10 +1127,15 @@ void mergeParallelMatMuls(const std::shared_ptr<ov::Model>& m, Context& ctx) {
         auto new_rshp = std::make_shared<ov::op::v1::Reshape>(new_mul, new_rshp_c, false);
 
         // Transpose input_b if concat was done by 0th axis (meaning the original MM's input_b were also transposed)
+        // The activation is taken before the optional Convert of the original MatMuls, so its type
+        // may differ from the merged weight (e.g. f16 function input vs f32 weight). Align the input,
+        // then restore the original output type for the readers.
+        ov::Output<ov::Node> act = orig_multiply;
+        if (act.get_element_type() != new_rshp->get_output_element_type(0)) {
+            act = std::make_shared<ov::op::v0::Convert>(act, new_rshp->get_output_element_type(0));
+        }
         std::shared_ptr<ov::Node> new_mm =
-            std::make_shared<ov::op::v0::MatMul>(orig_multiply, new_rshp, false, (axis_to_concat == 0));
-        // The activation is taken before the optional Convert of the original MatMuls,
-        // so the merged MatMul may produce another type (f16 instead of f32). Restore it for the readers.
+            std::make_shared<ov::op::v0::MatMul>(act, new_rshp, false, (axis_to_concat == 0));
         if (new_mm->get_output_element_type(0) != orig_out_type) {
             new_mm = std::make_shared<ov::op::v0::Convert>(new_mm, orig_out_type);
         }
