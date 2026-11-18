@@ -4,6 +4,7 @@
 #include "compiled_model.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <set>
@@ -18,6 +19,7 @@
 #include "just_sync_infer_request.hpp"
 #include "logging.hpp"
 #include "moe/moe_subgraph.hpp"
+#include "npuw_transformations/insert_vocab_sub128.hpp"
 #include "openvino/core/parallel.hpp"
 #include "openvino/op/util/op_types.hpp"
 #include "openvino/pass/constant_folding.hpp"
@@ -675,6 +677,12 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
                                                                          subgraph._sinks,
                                                                          subgraph._parameters,
                                                                          m_name + '_' + std::to_string(id));
+            // EXPERIMENT: no lazy closure is made for a subgraph that is not a function, so resolve
+            // the Sub128 shifts here. NPUW_EXP_NO_SUB128_MATERIALIZE=1 turns it off.
+            const char* no_materialize = std::getenv("NPUW_EXP_NO_SUB128_MATERIALIZE");
+            if (!(no_materialize && std::string(no_materialize) == "1")) {
+                ov::npuw::MaterializeSub128().run_on_model(m_compiled_submodels[id].model);
+            }
             m_compiled_submodels[id].pipeline.registration = subgraph._pipeline.registration;
             m_compiled_submodels[id].pipeline.context = subgraph._pipeline.context;
             if (subgraph._pipeline.compile_stage) {

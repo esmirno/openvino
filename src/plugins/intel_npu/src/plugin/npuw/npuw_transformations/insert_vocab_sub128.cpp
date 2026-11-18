@@ -4,10 +4,12 @@
 
 #include "insert_vocab_sub128.hpp"
 
+#include <map>
 #include <memory>
 #include <vector>
 
 #include "../logging.hpp"
+#include "../util.hpp"
 #include "cut_lm_head.hpp"
 #include "openvino/core/graph_util.hpp"
 #include "openvino/op/constant.hpp"
@@ -21,6 +23,8 @@
 #include "openvino/pass/pattern/op/optional.hpp"
 #include "openvino/pass/pattern/op/or.hpp"
 #include "openvino/pass/pattern/op/wrap_type.hpp"
+#include "openvino/runtime/make_tensor.hpp"
+#include "openvino/runtime/tensor.hpp"
 #include "transformations/rt_info/decompression.hpp"
 
 namespace opp = ov::pass::pattern;
@@ -281,4 +285,45 @@ bool ov::npuw::DetectVocabSharing::run_on_model(const std::shared_ptr<ov::Model>
         log_vocab_names("LM-head candidate:", lm_head_vocabs.front());
     }
     return false;
+}
+
+bool ov::npuw::MaterializeSub128::run_on_model(const std::shared_ptr<ov::Model>& model) {
+    // One i8 copy per u8 source, also when the weight is read by more than one shift.
+    std::map<const ov::Node*, std::shared_ptr<ov::op::v0::Constant>> shifted_sources;
+    std::size_t resolved = 0;
+    for (const auto& node : model->get_ordered_ops()) {
+        const auto shift = ov::as_type_ptr<ov::op::v1::Subtract>(node);
+        if (!shift || shift->get_rt_info().count(NPUW_SUB128_SHIFT_RT_INFO) == 0) {
+            continue;
+        }
+        const auto convert = ov::as_type_ptr<ov::op::v0::Convert>(shift->get_input_node_shared_ptr(0));
+        if (!convert) {
+            continue;
+        }
+        const auto source = ov::as_type_ptr<ov::op::v0::Constant>(convert->get_input_node_shared_ptr(0));
+        if (!source || source->get_element_type() != ov::element::u8) {
+            continue;
+        }
+
+        auto& shifted = shifted_sources[source.get()];
+        if (!shifted) {
+            ov::Tensor from(ov::element::u8, source->get_shape(), const_cast<void*>(source->get_data_ptr()));
+            ov::Tensor to(ov::element::i8, source->get_shape());
+            ov::npuw::util::subtract_128(ov::get_tensor_impl(from), ov::get_tensor_impl(to));
+            shifted = std::make_shared<ov::op::v0::Constant>(to);
+            shifted->set_friendly_name(source->get_friendly_name() + "_sub128");
+        }
+
+        // A new Convert keeps the original one valid for its other readers, if there are any.
+        auto shifted_convert = std::make_shared<ov::op::v0::Convert>(shifted, convert->get_destination_type());
+        shifted_convert->set_friendly_name(convert->get_friendly_name() + "_sub128");
+        ov::mark_as_decompression(shifted_convert);
+        ov::replace_node(shift, shifted_convert);
+        ++resolved;
+    }
+    if (resolved > 0) {
+        LOG_INFO("MaterializeSub128: resolved " << resolved << " Sub128 shift(s) with " << shifted_sources.size()
+                                                << " i8 constant(s) in " << model->get_friendly_name());
+    }
+    return resolved > 0;
 }

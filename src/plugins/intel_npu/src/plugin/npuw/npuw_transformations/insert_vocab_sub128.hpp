@@ -31,4 +31,14 @@ private:
     bool& m_shared;
 };
 
+// Resolves the Sub128 shifts that read a u8 Constant directly (a subgraph that is not a function,
+// so no lazy closure is made for it): Convert(u8 W) - 128 becomes Convert(i8 W - 128), the same
+// tensor that the lazy closure would make. Shifts that read a Parameter are not changed.
+class MaterializeSub128 : public ov::pass::ModelPass {
+public:
+    OPENVINO_MODEL_PASS_RTTI("ov::npuw::MaterializeSub128");
+
+    bool run_on_model(const std::shared_ptr<ov::Model>& model) override;
+};
+
 }  // namespace ov::npuw

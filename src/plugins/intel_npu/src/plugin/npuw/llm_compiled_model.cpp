@@ -886,7 +886,13 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         m_cfg.update({{"NPUW_LLM_CACHE_ROPE", "NO"}});
         // Shared vocabulary handling makes the decoding of INT4 Whisper models several times slower
         // in the default (not folded) configuration, so it is not used for Whisper.
-        if (m_cfg.get<::intel_npu::NPUW_LLM_VOCAB_ASYM_SHARED>()) {
+        // EXPERIMENT: NPUW_EXP_WHISPER_VOCAB_SHARED=1 keeps the shared vocabulary for Whisper.
+        const char* keep_shared_vocab = std::getenv("NPUW_EXP_WHISPER_VOCAB_SHARED");
+        const bool keep_shared = keep_shared_vocab && std::string(keep_shared_vocab) == "1";
+        if (keep_shared) {
+            LOG_INFO("NPUW_EXP_WHISPER_VOCAB_SHARED=1: NPUW_LLM_VOCAB_ASYM_SHARED is kept for Whisper.");
+        }
+        if (!keep_shared && m_cfg.get<::intel_npu::NPUW_LLM_VOCAB_ASYM_SHARED>()) {
             LOG_INFO("NPUW_LLM_VOCAB_ASYM_SHARED is not used for Whisper and is turned off.");
             m_cfg.update({{"NPUW_LLM_VOCAB_ASYM_SHARED", "NO"}});
         }
