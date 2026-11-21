@@ -4,6 +4,8 @@
 
 #include "opt.hpp"
 
+#include <cstdlib>
+
 #include "../../logging.hpp"
 #include "../../npuw_transformations/insert_vocab_sub128.hpp"
 #include "../../util.hpp"
@@ -1391,6 +1393,49 @@ ConvertDQVocab::ConvertDQVocab(Context::Ref ctx) {
             convert->input(0).replace_source_output(shifted);
             // after this we have: i8 derived Parameter -> Convert -> outer Subtract
             ov::replace_node(matched_shift, convert);
+        }
+        // EXPERIMENT (MTL): apply the per-row scale and the zero point after the MatMul on the [.., V] logits
+        // instead of dequantizing the whole [V, H] matrix on the device:
+        //   logits = S * (x @ Wq^T - Z * sum(x))
+        if (std::getenv("NPUW_VOCAB_POST_MATMUL") != nullptr) {
+            const auto sub = values.at(dequantized).get_node_shared_ptr();
+            if (sub->output(0).get_target_inputs().size() == 1) {
+                auto mul = sub->output(0).get_target_inputs().begin()->get_node()->shared_from_this();
+                if (ov::is_type<ov::op::v1::Multiply>(mul) && mul->output(0).get_target_inputs().size() == 1) {
+                    const auto scale = mul->input_value(0).get_node() == sub.get() ? mul->input_value(1) : mul->input_value(0);
+                    auto next = mul->output(0).get_target_inputs().begin()->get_node()->shared_from_this();
+                    if (ov::is_type<ov::op::v0::Convert>(next) && next->output(0).get_target_inputs().size() == 1) {
+                        next = next->output(0).get_target_inputs().begin()->get_node()->shared_from_this();
+                    }
+                    auto mm = ov::as_type_ptr<ov::op::v0::MatMul>(next);
+                    const auto act = mm ? mm->input_value(0) : ov::Output<ov::Node>();
+                    if (mm && !mm->get_transpose_a() && mm->get_transpose_b() && act.get_partial_shape().rank().is_static() &&
+                        scale.get_partial_shape().rank().is_static() && scale.get_partial_shape().rank().get_length() == 2) {
+                        const auto type = act.get_element_type();
+                        const auto rank = static_cast<size_t>(act.get_partial_shape().rank().get_length());
+                        const auto vocab = sub->get_output_shape(0)[0];
+                        std::vector<int64_t> row_shape(rank, 1);
+                        row_shape.back() = static_cast<int64_t>(vocab);
+                        auto row = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{rank}, row_shape);
+                        auto w = std::make_shared<ov::op::v0::Convert>(sub->input_value(0), type);
+                        auto new_mm = std::make_shared<ov::op::v0::MatMul>(act, w, false, true);
+                        auto s_row = std::make_shared<ov::op::v1::Reshape>(
+                            std::make_shared<ov::op::v0::Convert>(scale, type), row, false);
+                        auto z_row = std::make_shared<ov::op::v1::Reshape>(
+                            std::make_shared<ov::op::v0::Convert>(sub->input_value(1), type), row, false);
+                        auto axis = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, std::vector<int64_t>{-1});
+                        auto sum_x = std::make_shared<ov::op::v1::ReduceSum>(act, axis, true);
+                        auto corr = std::make_shared<ov::op::v1::Multiply>(z_row, sum_x);
+                        auto diff = std::make_shared<ov::op::v1::Subtract>(new_mm, corr);
+                        auto logits = std::make_shared<ov::op::v1::Multiply>(s_row, diff);
+                        logits->set_friendly_name(mm->get_friendly_name() + "/post_matmul_scale");
+                        logits->output(0).set_names(mm->output(0).get_names());
+                        ov::copy_runtime_info(mm, {new_mm, logits});
+                        ov::replace_node(mm, logits);
+                        LOG_INFO("ConvertDQVocab: scale and zero point moved after the MatMul");
+                    }
+                }
+            }
         }
         return true;
     };
