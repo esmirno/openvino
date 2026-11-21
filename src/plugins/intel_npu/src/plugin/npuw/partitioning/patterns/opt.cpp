@@ -1430,7 +1430,7 @@ ConvertDQVocab::ConvertDQVocab(Context::Ref ctx) {
                         auto logits = std::make_shared<ov::op::v1::Multiply>(s_row, diff);
                         logits->set_friendly_name(mm->get_friendly_name() + "/post_matmul_scale");
                         logits->output(0).set_names(mm->output(0).get_names());
-                        ov::copy_runtime_info(mm, {new_mm, logits});
+                        ov::copy_runtime_info(mm, ov::NodeVector{new_mm, logits});
                         ov::replace_node(mm, logits);
                         LOG_INFO("ConvertDQVocab: scale and zero point moved after the MatMul");
                     }
