@@ -1418,13 +1418,22 @@ ConvertDQVocab::ConvertDQVocab(Context::Ref ctx) {
                         row_shape.back() = static_cast<int64_t>(vocab);
                         auto row = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{rank}, row_shape);
                         auto w = std::make_shared<ov::op::v0::Convert>(sub->input_value(0), type);
-                        auto new_mm = std::make_shared<ov::op::v0::MatMul>(act, w, false, true);
+                        // Pre-scale the activation by 2^-6 so that the un-scaled integer MatMul output stays inside the fp16
+                        // range (|raw| reaches ~81k on real hidden states); 64 is folded into the row scale.
+                        const float pre = 1.0f / 64.0f;
+                        auto act_s = std::make_shared<ov::op::v1::Multiply>(
+                            act, ov::op::v0::Constant::create(type, ov::Shape{}, std::vector<float>{pre}));
+                        auto new_mm = std::make_shared<ov::op::v0::MatMul>(act_s, w, false, true);
                         auto s_row = std::make_shared<ov::op::v1::Reshape>(
-                            std::make_shared<ov::op::v0::Convert>(scale, type), row, false);
+                            std::make_shared<ov::op::v1::Multiply>(
+                                std::make_shared<ov::op::v0::Convert>(scale, type),
+                                ov::op::v0::Constant::create(type, ov::Shape{}, std::vector<float>{1.0f / pre})),
+                            row,
+                            false);
                         auto z_row = std::make_shared<ov::op::v1::Reshape>(
                             std::make_shared<ov::op::v0::Convert>(sub->input_value(1), type), row, false);
                         auto axis = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, std::vector<int64_t>{-1});
-                        auto sum_x = std::make_shared<ov::op::v1::ReduceSum>(act, axis, true);
+                        auto sum_x = std::make_shared<ov::op::v1::ReduceSum>(act_s, axis, true);
                         auto corr = std::make_shared<ov::op::v1::Multiply>(z_row, sum_x);
                         auto diff = std::make_shared<ov::op::v1::Subtract>(new_mm, corr);
                         auto logits = std::make_shared<ov::op::v1::Multiply>(s_row, diff);
